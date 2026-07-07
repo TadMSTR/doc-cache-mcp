@@ -63,8 +63,8 @@ def fake_ds(monkeypatch):
     return ds
 
 
-def test_sync_ok(fake_ds):
-    r = server.doc_cache_sync("svc")
+async def test_sync_ok(fake_ds):
+    r = await server.doc_cache_sync("svc")
     assert r["entries_synced"] == 1
     assert r["chunks"] == 3
     assert r["indexed"]["indexed"] is True
@@ -72,23 +72,76 @@ def test_sync_ok(fake_ds):
     assert fake_ds.calls == [("svc", False, True)]
 
 
-def test_sync_dry_run_does_not_index(fake_ds):
-    r = server.doc_cache_sync("svc", dry_run=True)
+async def test_sync_dry_run_does_not_index(fake_ds):
+    r = await server.doc_cache_sync("svc", dry_run=True)
     assert r["dry_run"] is True
     assert fake_ds.calls == [("svc", True, True)]
 
 
-def test_sync_unknown_service(fake_ds):
-    r = server.doc_cache_sync("missing")
+async def test_sync_unknown_service(fake_ds):
+    r = await server.doc_cache_sync("missing")
     assert "error" in r
     assert "Unknown service" in r["error"]
 
 
-def test_sync_rejects_bad_name(fake_ds):
-    r = server.doc_cache_sync("bad name!")
+async def test_sync_rejects_bad_name(fake_ds):
+    r = await server.doc_cache_sync("bad name!")
     assert "error" in r
     # A bad name is rejected before the doc-sync layer is ever touched.
     assert fake_ds.calls == []
+
+
+async def test_sync_without_ctx_does_not_crash(fake_ds):
+    # No Context (e.g. a direct call, or a client that never opened a session) — the
+    # heartbeat must silently no-op rather than raise.
+    r = await server.doc_cache_sync("svc", ctx=None)
+    assert r["entries_synced"] == 1
+
+
+async def test_sync_reports_progress_while_running(fake_ds, monkeypatch):
+    # Make the "sync" step slow enough for at least one heartbeat tick to fire, using a
+    # near-zero interval so the test stays fast.
+    monkeypatch.setattr(server, "_SYNC_HEARTBEAT_INTERVAL_S", 0.01)
+
+    original_sync_service = fake_ds.sync_service
+
+    def slow_sync_service(service, *, force=False, dry_run=False, index=True):
+        import time as _time
+
+        _time.sleep(0.05)
+        return original_sync_service(service, force=force, dry_run=dry_run, index=index)
+
+    monkeypatch.setattr(fake_ds, "sync_service", slow_sync_service)
+
+    calls = []
+
+    class FakeCtx:
+        async def report_progress(self, progress, total, message):
+            calls.append((progress, total, message))
+
+    r = await server.doc_cache_sync("svc", ctx=FakeCtx())
+    assert r["entries_synced"] == 1
+    assert len(calls) >= 1
+    assert calls[0][1] is None  # total is unknown (open-ended elapsed time)
+    assert "svc" in calls[0][2]
+
+
+async def test_sync_heartbeat_stops_after_completion(fake_ds, monkeypatch):
+    monkeypatch.setattr(server, "_SYNC_HEARTBEAT_INTERVAL_S", 0.01)
+    calls = []
+
+    class FakeCtx:
+        async def report_progress(self, progress, total, message):
+            calls.append(progress)
+
+    await server.doc_cache_sync("svc", ctx=FakeCtx())
+    count_at_return = len(calls)
+    # Give the event loop a moment — if the heartbeat task weren't cancelled it would
+    # keep appending.
+    import asyncio
+
+    await asyncio.sleep(0.05)
+    assert len(calls) == count_at_return
 
 
 def test_list_services(fake_ds):

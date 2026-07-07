@@ -4,6 +4,27 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] — 2026-07-07
+
+### Fixed
+- `doc_cache_sync` exceeded MCP client idle-timeouts (typically 300s) on every call,
+  because the memsearch reindex step (whole docs cache — 6788 chunks across 59 services
+  at time of report) dominates runtime regardless of how small the synced service is. The
+  tool call succeeded server-side but was reported as hung/failed client-side. Found by
+  research during Phase 5 verify (task `3a8f6098`).
+  - `doc_cache_sync` is now async and accepts an optional FastMCP `Context`; it reports
+    progress every 15s while the sync runs (`asyncio.to_thread` off the event loop, so the
+    heartbeat can actually tick during the blocking memsearch subprocess). No-op if the
+    caller's client doesn't send a `progressToken` — never errors, never changes behavior
+    for clients that don't support progress.
+  - Docstring now states the reindex covers the whole cache and can take several minutes.
+  - **Deliberately not implemented**: narrowing the memsearch index call to just the synced
+    service's directory. `memsearch index` does "stale cleanup" (deletes chunks for files
+    no longer on disk) and its docs don't specify whether that's scoped to the passed
+    `PATHS` or the whole collection — guessing wrong against the shared production Milvus
+    collection risks silently deleting other services' cached docs. Left as a candidate
+    fast-follow, gated on verifying that behavior against a non-production collection.
+
 ## [0.1.0] — 2026-07-07
 
 Initial build. Capability-scoped docs-cache MCP replacing research's generic system-ops

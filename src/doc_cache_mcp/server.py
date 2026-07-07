@@ -14,6 +14,8 @@ validated against the allowlist before it can enter the trusted cache (see allow
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import re
 import subprocess
@@ -22,7 +24,7 @@ from pathlib import Path
 
 import structlog
 import yaml
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -42,6 +44,11 @@ _SERVICE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # so it can never break out of the frontmatter block or the tags list.
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MAX_URL_LEN = 2048
+# How often doc_cache_sync reports progress while the (blocking) memsearch index step
+# runs. Some MCP clients treat a long gap with no response/progress as a hung call and
+# abort — a full-corpus reindex can take several minutes, so a heartbeat well under any
+# realistic idle-timeout keeps the call alive without changing what actually runs.
+_SYNC_HEARTBEAT_INTERVAL_S = 15
 
 
 class DocEntry(BaseModel):
@@ -294,14 +301,45 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
     }
 
 
+async def _heartbeat(ctx: Context | None, service: str) -> None:
+    """Emit a progress notification every _SYNC_HEARTBEAT_INTERVAL_S while a sync runs.
+
+    A no-op if the caller's client didn't send a progressToken on the request (FastMCP
+    silently drops report_progress calls in that case — see fastmcp/docs/servers/progress).
+    Cancelled by the caller once the sync completes; runs forever otherwise, so it must
+    never be awaited to completion.
+    """
+    if ctx is None:
+        return
+    elapsed = 0
+    while True:
+        await asyncio.sleep(_SYNC_HEARTBEAT_INTERVAL_S)
+        elapsed += _SYNC_HEARTBEAT_INTERVAL_S
+        await ctx.report_progress(
+            progress=elapsed,
+            total=None,
+            message=(
+                f"syncing {service}: {elapsed}s elapsed — a full-corpus memsearch "
+                "reindex can take several minutes"
+            ),
+        )
+
+
 @mcp.tool
-def doc_cache_sync(service: str, dry_run: bool = False) -> dict:
+async def doc_cache_sync(
+    service: str, dry_run: bool = False, ctx: Context | None = None
+) -> dict:
     """Ingest / refresh a configured service into the docs cache.
 
     Fetches each of the service's source URLs, converts + chunks them, writes the chunks
     to the cache, updates state, and (unless ``dry_run``) indexes the cache into memsearch
     so the new docs are searchable. The service must already exist in the config — add it
     first with ``doc_cache_add_service``.
+
+    The memsearch step reindexes the whole docs cache (not just this service), so a sync
+    can take several minutes even when only one small entry changed. Progress
+    notifications are sent every 15s while it runs so MCP clients don't treat the call as
+    hung; raise your client-side timeout if it doesn't support progress notifications.
 
     Args:
         service: Service key to sync (must exist in doc-sync.yml).
@@ -313,13 +351,21 @@ def doc_cache_sync(service: str, dry_run: bool = False) -> dict:
 
     ds = load_doc_sync()
     t0 = time.perf_counter()
+    heartbeat = asyncio.create_task(_heartbeat(ctx, service))
     try:
-        result = ds.sync_service(service, dry_run=dry_run)
+        # sync_service (fetch + chunk + the blocking memsearch subprocess) is synchronous
+        # doc-sync logic shared with the CLI cron — run it off the event loop so the
+        # heartbeat task above can actually keep ticking while it's in flight.
+        result = await asyncio.to_thread(ds.sync_service, service, dry_run=dry_run)
     except ValueError as e:  # unknown service — safe, useful message (no paths)
         return {"error": str(e)}
     except FileNotFoundError as e:
         log.error("sync_config_missing", error=str(e))
         return {"error": "docs cache config or sync module not found"}
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
     duration = round(time.perf_counter() - t0, 3)
 
     log.info(
