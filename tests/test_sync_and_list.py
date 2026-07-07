@@ -13,12 +13,19 @@ class FakeDocSync:
         self.calls = []
 
     def load_config(self):
-        return {"services": {"svc": [{"topic": "overview", "url": "https://x/README.md"}]}}
+        return {
+            "services": {"svc": [{"topic": "overview", "url": "https://x/README.md"}]}
+        }
 
     def load_state(self):
         return {
             "svc": [
-                {"topic": "overview", "url": "https://x/README.md", "chunks": 3, "synced": "2026-07-07"}
+                {
+                    "topic": "overview",
+                    "url": "https://x/README.md",
+                    "chunks": 3,
+                    "synced": "2026-07-07",
+                }
             ]
         }
 
@@ -28,13 +35,24 @@ class FakeDocSync:
             raise ValueError(f"Unknown service: {service}")
         if dry_run:
             return {
-                "service": service, "entries_synced": 0, "chunks": 0, "errors": 0,
-                "indexed": None, "dry_run": True, "results": [],
+                "service": service,
+                "entries_synced": 0,
+                "chunks": 0,
+                "errors": 0,
+                "indexed": None,
+                "dry_run": True,
+                "results": [],
             }
         return {
-            "service": service, "entries_synced": 1, "chunks": 3, "errors": 0,
+            "service": service,
+            "entries_synced": 1,
+            "chunks": 3,
+            "errors": 0,
             "indexed": {"indexed": True, "returncode": 0, "timed_out": False},
-            "dry_run": False, "results": [{"topic": "overview", "url": "https://x/README.md", "chunks": 3}],
+            "dry_run": False,
+            "results": [
+                {"topic": "overview", "url": "https://x/README.md", "chunks": 3}
+            ],
         }
 
 

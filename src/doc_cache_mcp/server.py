@@ -47,8 +47,12 @@ _MAX_URL_LEN = 2048
 class DocEntry(BaseModel):
     """One documentation source: a topic label and the https URL to fetch it from."""
 
-    topic: str = Field(description="Short topic slug, e.g. 'overview' or 'docker-install'.")
-    url: str = Field(description="https source URL; must pass the docs-cache allowlist.")
+    topic: str = Field(
+        description="Short topic slug, e.g. 'overview' or 'docker-install'."
+    )
+    url: str = Field(
+        description="https source URL; must pass the docs-cache allowlist."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -90,15 +94,28 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
     rel = str(config_path.resolve().relative_to(repo))
     add = subprocess.run(
         ["git", "-C", str(repo), "add", "--", rel],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if add.returncode != 0:
         # Keep git stderr in the log, not in the caller-facing response (F-03).
         log.error("git_add_failed", stderr=add.stderr.strip())
         return {"committed": False, "error": "git add failed"}
     commit = subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", f"doc-cache: add {service}", "--", rel],
-        capture_output=True, text=True, timeout=30,
+        [
+            "git",
+            "-C",
+            str(repo),
+            "commit",
+            "-m",
+            f"doc-cache: add {service}",
+            "--",
+            rel,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if commit.returncode != 0:
         out = (commit.stdout + commit.stderr).lower()
@@ -108,7 +125,9 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
         return {"committed": False, "error": "git commit failed"}
     rev = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     return {"committed": True, "commit": rev.stdout.strip()}
 
@@ -230,14 +249,21 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
         return {"error": "doc-sync.yml 'services' is not a mapping"}
 
     block = services.get(service) or []
-    by_topic = {e["topic"]: dict(e) for e in block if isinstance(e, dict) and "topic" in e}
+    by_topic = {
+        e["topic"]: dict(e) for e in block if isinstance(e, dict) and "topic" in e
+    }
     for ent in clean:
         by_topic[ent["topic"]] = ent
     merged = list(by_topic.values())
     services[service] = merged
 
-    text = yaml.safe_dump(config, sort_keys=False, default_flow_style=False,
-                          allow_unicode=True, width=1000)
+    text = yaml.safe_dump(
+        config,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=1000,
+    )
     _atomic_write(real, text)
 
     commit = {"committed": False, "note": "git_commit disabled"}
@@ -255,9 +281,17 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
         total_topics=len(merged),
         committed=commit.get("committed"),
     )
-    emit_metric("doc_cache_tool", {"tool": "add_service"},
-                {"added": len(clean), "total_topics": len(merged)})
-    return {"service": service, "entries": merged, "added": len(clean), "commit": commit}
+    emit_metric(
+        "doc_cache_tool",
+        {"tool": "add_service"},
+        {"added": len(clean), "total_topics": len(merged)},
+    )
+    return {
+        "service": service,
+        "entries": merged,
+        "added": len(clean),
+        "commit": commit,
+    }
 
 
 @mcp.tool
@@ -300,10 +334,12 @@ def doc_cache_sync(service: str, dry_run: bool = False) -> dict:
     emit_metric(
         "doc_cache_tool",
         {"tool": "sync", "service": service},
-        {"entries_synced": result.get("entries_synced", 0),
-         "chunks": result.get("chunks", 0),
-         "errors": result.get("errors", 0),
-         "duration_s": duration},
+        {
+            "entries_synced": result.get("entries_synced", 0),
+            "chunks": result.get("chunks", 0),
+            "errors": result.get("errors", 0),
+            "duration_s": duration,
+        },
     )
     result["duration_s"] = duration
     return result

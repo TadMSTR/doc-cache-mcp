@@ -36,13 +36,19 @@ def init_tracing() -> None:
         return
     try:
         from opentelemetry import trace
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter,
+        )
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-        provider = TracerProvider(resource=Resource.create({"service.name": "doc-cache-mcp"}))
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+        provider = TracerProvider(
+            resource=Resource.create({"service.name": "doc-cache-mcp"})
+        )
+        provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+        )
         trace.set_tracer_provider(provider)
         _tracer = trace.get_tracer("doc-cache-mcp")
         structlog.get_logger().info("otel_enabled", endpoint=endpoint)

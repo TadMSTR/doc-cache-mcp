@@ -26,6 +26,7 @@ def _unresolvable(host):
 
 # --- scheme / host shape --------------------------------------------------
 
+
 def test_http_scheme_rejected():
     with pytest.raises(AllowlistError):
         validate_url("http://raw.githubusercontent.com/a/README.md", ALLOW, PUBLIC)
@@ -47,6 +48,7 @@ def test_no_host_rejected():
 
 
 # --- IP literals (classic SSRF payload shapes) ----------------------------
+
 
 def test_link_local_metadata_ip_rejected():
     # 169.254.169.254 — the cloud metadata service, the canonical SSRF target.
@@ -72,6 +74,7 @@ def test_public_ip_literal_rejected():
 
 # --- host allowlist -------------------------------------------------------
 
+
 def test_public_allowlisted_host_ok():
     u = "https://raw.githubusercontent.com/o/r/main/README.md"
     assert validate_url(u, ALLOW, PUBLIC) == u
@@ -90,6 +93,7 @@ def test_forge_host_not_explicitly_listed_rejected():
 
 # --- DNS-rebind guard -----------------------------------------------------
 
+
 def test_allowlisted_host_resolving_private_rejected():
     # raw.githubusercontent.com is allowlisted, but if it resolves to a private IP the
     # rebind guard must reject the fetch.
@@ -104,6 +108,7 @@ def test_unresolvable_allowlisted_host_denied():
 
 
 # --- forge endpoints ------------------------------------------------------
+
 
 def test_forge_endpoint_allowed_without_dns_recheck():
     # Forge endpoints are explicitly trusted and may resolve internal — the resolver here
@@ -123,6 +128,7 @@ def test_forge_endpoint_wrong_host_rejected():
 
 
 # --- allowlist file loading ----------------------------------------------
+
 
 def test_load_missing_allowlist_fails_closed(tmp_path):
     with pytest.raises(AllowlistError):
@@ -151,7 +157,13 @@ def test_seeded_allowlist_loads_and_enforces(tmp_path):
     # The real seeded allowlist should load and allow a known host, deny an unknown one.
     from pathlib import Path
 
-    real = Path.home() / "repos" / "gitea" / "host-forge-scripts" / "doc-cache-allowlist.yml"
+    real = (
+        Path.home()
+        / "repos"
+        / "gitea"
+        / "host-forge-scripts"
+        / "doc-cache-allowlist.yml"
+    )
     if not real.exists():
         pytest.skip("seeded allowlist not present")
     al = load_allowlist(real)

@@ -65,7 +65,9 @@ def test_direct_fetch_ok():
 
 
 def test_redirect_to_ip_literal_internal_rejected():
-    m = _setup(_load(), [FakeResp(302, location="https://169.254.169.254/latest/meta-data/")])
+    m = _setup(
+        _load(), [FakeResp(302, location="https://169.254.169.254/latest/meta-data/")]
+    )
     with pytest.raises(m._allow.AllowlistError):
         m.safe_fetch(FORGE)
     # The internal redirect target was refused BEFORE being fetched.

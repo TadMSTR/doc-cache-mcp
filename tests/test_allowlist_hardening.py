@@ -24,6 +24,7 @@ def _unresolvable(host):
 
 # --- F-02: forge_endpoint path-prefix boundary + traversal --------------------
 
+
 def test_forge_endpoint_exact_path_ok():
     u = "https://vikunja.helmforge.me/api/v1/docs.json"
     assert validate_url(u, ALLOW, _unresolvable) == u
@@ -32,18 +33,30 @@ def test_forge_endpoint_exact_path_ok():
 def test_forge_endpoint_sibling_prefix_rejected():
     # docs.json.backup shares the string prefix but not the path boundary.
     with pytest.raises(AllowlistError):
-        validate_url("https://vikunja.helmforge.me/api/v1/docs.json.backup", ALLOW, _resolver("93.184.216.34"))
+        validate_url(
+            "https://vikunja.helmforge.me/api/v1/docs.json.backup",
+            ALLOW,
+            _resolver("93.184.216.34"),
+        )
 
 
 def test_forge_endpoint_suffix_glued_rejected():
     with pytest.raises(AllowlistError):
-        validate_url("https://vikunja.helmforge.me/api/v1/docs.jsonanything", ALLOW, _resolver("93.184.216.34"))
+        validate_url(
+            "https://vikunja.helmforge.me/api/v1/docs.jsonanything",
+            ALLOW,
+            _resolver("93.184.216.34"),
+        )
 
 
 def test_forge_endpoint_traversal_rejected():
     # /api/v1/docs.json/../tasks normalises to /api/v1/tasks — must not match the prefix.
     with pytest.raises(AllowlistError):
-        validate_url("https://vikunja.helmforge.me/api/v1/docs.json/../tasks", ALLOW, _resolver("93.184.216.34"))
+        validate_url(
+            "https://vikunja.helmforge.me/api/v1/docs.json/../tasks",
+            ALLOW,
+            _resolver("93.184.216.34"),
+        )
 
 
 def test_forge_endpoint_boundary_subpath_ok():
@@ -60,10 +73,13 @@ def test_host_prefix_allows_any_path():
 
 # --- F-04: IPv4-mapped / 6to4 IPv6 must not slip a private address through ----
 
+
 def test_mapped_ipv6_private_rejected():
     # An allowlisted public host that resolves to ::ffff:192.168.1.12 must be refused.
     with pytest.raises(AllowlistError):
-        validate_url("https://docs.example.com/x", ALLOW, _resolver("::ffff:192.168.1.12"))
+        validate_url(
+            "https://docs.example.com/x", ALLOW, _resolver("::ffff:192.168.1.12")
+        )
 
 
 def test_mapped_ipv6_loopback_rejected():

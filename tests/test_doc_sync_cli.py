@@ -17,7 +17,9 @@ pytestmark = pytest.mark.skipif(not DOCSYNC.exists(), reason="doc-sync.py not pr
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("forge_doc_sync_regression", str(DOCSYNC))
+    spec = importlib.util.spec_from_file_location(
+        "forge_doc_sync_regression", str(DOCSYNC)
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -25,16 +27,26 @@ def _load():
 
 def test_importable_api_present():
     m = _load()
-    for name in ("sync_service", "load_config", "load_state", "state_lock",
-                 "_sync_service_entries", "run_memsearch_index"):
+    for name in (
+        "sync_service",
+        "load_config",
+        "load_state",
+        "state_lock",
+        "_sync_service_entries",
+        "run_memsearch_index",
+    ):
         assert hasattr(m, name), f"missing {name}"
     sig = inspect.signature(m.sync_service)
     assert set(["force", "dry_run", "index"]).issubset(sig.parameters)
 
 
 def test_cli_help_still_works():
-    r = subprocess.run([sys.executable, str(DOCSYNC), "--help"],
-                       capture_output=True, text=True, timeout=30)
+    r = subprocess.run(
+        [sys.executable, str(DOCSYNC), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert r.returncode == 0
     assert "--service" in r.stdout
     assert "--dry-run" in r.stdout
@@ -42,8 +54,12 @@ def test_cli_help_still_works():
 
 
 def test_cli_unknown_service_exits_1():
-    r = subprocess.run([sys.executable, str(DOCSYNC), "--service", "__does_not_exist__"],
-                       capture_output=True, text=True, timeout=30)
+    r = subprocess.run(
+        [sys.executable, str(DOCSYNC), "--service", "__does_not_exist__"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert r.returncode == 1
     assert "Unknown service" in (r.stdout + r.stderr)
 
@@ -55,8 +71,12 @@ def test_cli_dry_run_prints_and_writes_nothing():
     if not services:
         pytest.skip("no services configured")
     svc = services[0]
-    r = subprocess.run([sys.executable, str(DOCSYNC), "--dry-run", "--service", svc],
-                       capture_output=True, text=True, timeout=30)
+    r = subprocess.run(
+        [sys.executable, str(DOCSYNC), "--dry-run", "--service", svc],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert r.returncode == 0
     assert "WOULD SYNC" in r.stdout
 
