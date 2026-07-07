@@ -34,10 +34,16 @@ class Settings(BaseSettings):
     # The docs cache config the add-tool edits (symlink resolved before writing/committing).
     config_path: Path = Path.home() / "docs" / "doc-sync.yml"
 
-    # Source-URL allowlist (git-backed, sysadmin-editable). Default-deny.
+    # Source-URL allowlist data file (git-backed, sysadmin-editable). Default-deny.
     allowlist_path: Path = (
         Path.home() / "repos" / "gitea" / "host-forge-scripts" / "doc-cache-allowlist.yml"
     )
+
+    # The shared allowlist *module* (single source of truth, next to doc-sync.py). Both the
+    # doc-sync-daily cron (fetch-time) and this server (add-time) import it, so add-time and
+    # fetch-time policy can never drift. Hyphen-free name, but loaded by path since it lives
+    # outside this package.
+    allowlist_module_path: Path = Path.home() / "scripts" / "doc_cache_allowlist.py"
 
     # Commit doc-sync.yml to git after a successful add. Set false to stage-only / leave
     # commits to a human or the cron (see plan.md open question).

@@ -48,14 +48,23 @@ of the edit, not its *content*, so it had nowhere to enforce this.
 
 7. **Loopback only.** Binds `127.0.0.1`. No off-host exposure, no auth surface added.
 
-## Residual notes / for the audit
+## Fetch-time enforcement (post-audit, F-01)
+
+The allowlist is a **single shared module** (`doc_cache_allowlist`, next to `doc-sync.py`)
+enforced at **both** boundaries:
+
+- **Add time** — `doc_cache_add_service` validates every URL before it is written.
+- **Fetch time** — `doc-sync.py` `safe_fetch` re-validates the URL **and every redirect hop**
+  immediately before each request (`allow_redirects=False`, manual per-hop re-validation).
+  This runs the DNS resolve-and-recheck in the same process as the fetch, so the add-time /
+  fetch-time TOCTOU is closed and an allowlisted host cannot 301/302 the fetcher to an
+  internal address. The `doc-sync-daily` cron shares this path, so it too is covered — and
+  now depends on `doc-cache-allowlist.yml` being present.
+
+## Residual notes
 
 - `doc_cache_add_service` uses `yaml.safe_dump`, which **does not preserve comments** in
-  `doc-sync.yml`. The first add rewrites the file without its section comments. This is the
-  documented plan tradeoff (structural, not text, merge); flagged for review.
-- The allowlist re-check resolves DNS at validation time, not at fetch time — a host that
-  passes validation and rebinds before the subsequent `doc_cache_sync` fetch is a
-  theoretical TOCTOU window. Fetches only run against already-configured, previously
-  validated hosts; the fetch path itself does not re-validate (inherited `doc-sync` fetch).
+  `doc-sync.yml` (F-06, accepted). The first add rewrites the file without its section
+  comments — the documented plan tradeoff (structural, not text, merge).
 - The server runs as `ted`; OS-level file permissions, not the server, bound its reach
   beyond the configured paths.

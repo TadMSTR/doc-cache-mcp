@@ -93,7 +93,9 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
         capture_output=True, text=True, timeout=30,
     )
     if add.returncode != 0:
-        return {"committed": False, "error": f"git add failed: {add.stderr.strip()}"}
+        # Keep git stderr in the log, not in the caller-facing response (F-03).
+        log.error("git_add_failed", stderr=add.stderr.strip())
+        return {"committed": False, "error": "git add failed"}
     commit = subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", f"doc-cache: add {service}", "--", rel],
         capture_output=True, text=True, timeout=30,
@@ -102,7 +104,8 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
         out = (commit.stdout + commit.stderr).lower()
         if "nothing to commit" in out or "no changes added" in out:
             return {"committed": False, "note": "no changes to commit"}
-        return {"committed": False, "error": f"git commit failed: {commit.stderr.strip()}"}
+        log.error("git_commit_failed", stderr=commit.stderr.strip())
+        return {"committed": False, "error": "git commit failed"}
     rev = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
         capture_output=True, text=True, timeout=10,
@@ -127,7 +130,8 @@ def doc_cache_list_services() -> dict:
     try:
         config = ds.load_config()
     except FileNotFoundError as e:
-        return {"error": str(e)}
+        log.error("load_config_failed", error=str(e))
+        return {"error": "docs cache config not found"}
     state = ds.load_state()
 
     services = []
@@ -216,7 +220,8 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
     try:
         config = yaml.safe_load(real.read_text()) or {}
     except (FileNotFoundError, yaml.YAMLError) as e:
-        return {"error": f"cannot read config {real}: {e}"}
+        log.error("config_read_failed", error=str(e))
+        return {"error": "cannot read docs cache config"}
     if not isinstance(config, dict):
         return {"error": "doc-sync.yml is not a YAML mapping"}
 
@@ -240,7 +245,8 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
         try:
             commit = _git_commit_config(real, service)
         except Exception as e:  # noqa: BLE001 — surface, don't crash the tool
-            commit = {"committed": False, "error": f"git commit error: {e}"}
+            log.error("git_commit_error", error=str(e))
+            commit = {"committed": False, "error": "git commit error"}
 
     log.info(
         "doc_cache_add_service",
@@ -275,10 +281,11 @@ def doc_cache_sync(service: str, dry_run: bool = False) -> dict:
     t0 = time.perf_counter()
     try:
         result = ds.sync_service(service, dry_run=dry_run)
-    except ValueError as e:  # unknown service
+    except ValueError as e:  # unknown service — safe, useful message (no paths)
         return {"error": str(e)}
     except FileNotFoundError as e:
-        return {"error": str(e)}
+        log.error("sync_config_missing", error=str(e))
+        return {"error": "docs cache config or sync module not found"}
     duration = round(time.perf_counter() - t0, 3)
 
     log.info(
