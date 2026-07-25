@@ -29,8 +29,8 @@ from __future__ import annotations
 import ipaddress
 import posixpath
 import socket
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 from urllib.parse import urlparse
 
 import yaml
@@ -127,9 +127,7 @@ def _assert_resolves_public(host: str, resolver: Resolver) -> None:
     try:
         infos = resolver(host)
     except OSError as exc:
-        raise AllowlistError(
-            f"cannot resolve allowlisted host {host!r}: {exc}"
-        ) from exc
+        raise AllowlistError(f"cannot resolve allowlisted host {host!r}: {exc}") from exc
     if not infos:
         raise AllowlistError(f"host {host!r} did not resolve to any address")
     for info in infos:
@@ -160,9 +158,7 @@ def validate_url(url: str, allowlist: dict, resolver: Resolver | None = None) ->
 
     parsed = urlparse(url.strip())
     if parsed.scheme != "https":
-        raise AllowlistError(
-            f"source url must use https (got scheme {parsed.scheme!r}): {url!r}"
-        )
+        raise AllowlistError(f"source url must use https (got scheme {parsed.scheme!r}): {url!r}")
     host = parsed.hostname
     if not host:
         raise AllowlistError(f"source url has no host: {url!r}")
@@ -172,9 +168,7 @@ def validate_url(url: str, allowlist: dict, resolver: Resolver | None = None) ->
     # is exactly how an SSRF payload names an internal target.
     try:
         ipaddress.ip_address(host.strip("[]"))
-        raise AllowlistError(
-            f"source url host must be a name, not an IP literal: {host!r}"
-        )
+        raise AllowlistError(f"source url host must be a name, not an IP literal: {host!r}")
     except ValueError:
         pass  # not an IP literal — good, it's a hostname
 

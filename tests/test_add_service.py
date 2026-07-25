@@ -45,9 +45,7 @@ def ws(tmp_path, monkeypatch):
 
 
 def test_add_new_service(ws):
-    r = server.doc_cache_add_service(
-        "newsvc", [_entry("overview", "https://docs.example.com/a")]
-    )
+    r = server.doc_cache_add_service("newsvc", [_entry("overview", "https://docs.example.com/a")])
     assert "error" not in r, r
     data = yaml.safe_load(ws.read_text())
     assert data["services"]["newsvc"] == [
@@ -69,15 +67,11 @@ def test_add_replaces_topic_url(ws):
     server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/a")])
     server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/b")])
     data = yaml.safe_load(ws.read_text())
-    assert [e["url"] for e in data["services"]["newsvc"]] == [
-        "https://docs.example.com/b"
-    ]
+    assert [e["url"] for e in data["services"]["newsvc"]] == ["https://docs.example.com/b"]
 
 
 def test_add_extends_existing_service(ws):
-    r = server.doc_cache_add_service(
-        "existing", [_entry("install", "https://docs.example.com/i")]
-    )
+    r = server.doc_cache_add_service("existing", [_entry("install", "https://docs.example.com/i")])
     assert "error" not in r, r
     data = yaml.safe_load(ws.read_text())
     topics = [e["topic"] for e in data["services"]["existing"]]
@@ -93,18 +87,14 @@ def test_add_forge_endpoint_ok(ws):
 
 def test_reject_insecure_url_writes_nothing(ws):
     before = ws.read_text()
-    r = server.doc_cache_add_service(
-        "newsvc", [_entry("t", "http://docs.example.com/a")]
-    )
+    r = server.doc_cache_add_service("newsvc", [_entry("t", "http://docs.example.com/a")])
     assert "error" in r
     assert ws.read_text() == before
 
 
 def test_reject_unlisted_host_writes_nothing(ws):
     before = ws.read_text()
-    r = server.doc_cache_add_service(
-        "newsvc", [_entry("t", "https://evil.example.net/a")]
-    )
+    r = server.doc_cache_add_service("newsvc", [_entry("t", "https://evil.example.net/a")])
     assert "error" in r
     assert ws.read_text() == before
 
@@ -123,16 +113,12 @@ def test_all_or_nothing_when_one_url_bad(ws):
 
 
 def test_reject_bad_service_name(ws):
-    r = server.doc_cache_add_service(
-        "bad name!", [_entry("t", "https://docs.example.com/a")]
-    )
+    r = server.doc_cache_add_service("bad name!", [_entry("t", "https://docs.example.com/a")])
     assert "error" in r
 
 
 def test_reject_bad_topic(ws):
-    r = server.doc_cache_add_service(
-        "svc", [_entry("bad topic", "https://docs.example.com/a")]
-    )
+    r = server.doc_cache_add_service("svc", [_entry("bad topic", "https://docs.example.com/a")])
     assert "error" in r
 
 
@@ -185,14 +171,10 @@ def test_git_commit_scopes_to_single_file(tmp_path, monkeypatch):
     monkeypatch.setenv("DOC_CACHE_MCP_CONFIG_PATH", str(cfg))
     monkeypatch.setenv("DOC_CACHE_MCP_ALLOWLIST_PATH", str(allow))
     monkeypatch.setenv("DOC_CACHE_MCP_GIT_COMMIT", "true")
-    monkeypatch.setattr(
-        "socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))]
-    )
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
     config.reset_settings()
 
-    r = server.doc_cache_add_service(
-        "newsvc", [_entry("t", "https://docs.example.com/a")]
-    )
+    r = server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/a")])
     assert "error" not in r, r
     assert r["commit"]["committed"] is True, r["commit"]
 

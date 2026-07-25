@@ -75,6 +75,7 @@ Environment variables (prefix `DOC_CACHE_MCP_`):
 | `DOC_CACHE_MCP_CONFIG_PATH` | `~/docs/doc-sync.yml` | Docs cache config the add-tool edits. |
 | `DOC_CACHE_MCP_ALLOWLIST_PATH` | `host-forge-scripts/doc-cache-allowlist.yml` | Source-URL allowlist. |
 | `DOC_CACHE_MCP_GIT_COMMIT` | `true` | Commit `doc-sync.yml` after a successful add. |
+| `DOC_CACHE_MCP_MAX_ENTRIES_PER_ADD` | `50` | Ceiling on source entries accepted in one `add_service` call. |
 
 ## Development
 
@@ -89,6 +90,19 @@ pytest
 PM2 process on `127.0.0.1:8503` via `ecosystem.config.js`. See the build plan for the
 manifest cutover (removing research's `system-ops` grant) — that is a separate, gated
 sysadmin step.
+
+## Observability
+
+Structured logging (structlog, JSON to stdout) is always on. Two optional backends are each
+gated on their own env var and disabled — with no import cost — when unset. Install the extras
+with `pip install ".[telemetry]"`.
+
+| Var | Enables |
+|-----|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP span export (e.g. `http://127.0.0.1:4317`). `service.name` is `doc-cache-mcp`. |
+| `INFLUXDB_URL` | Best-effort per-call metric emission to InfluxDB 3. |
+| `INFLUXDB_TOKEN` | Auth token for the InfluxDB backend. |
+| `INFLUXDB_BUCKET` | Target database/bucket (default `doc-cache-mcp`). |
 
 ## License
 

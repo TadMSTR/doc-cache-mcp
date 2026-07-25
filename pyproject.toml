@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "PyYAML>=6.0",
+    "ruff==0.16.0",
 ]
 
 [project.scripts]
@@ -52,3 +53,11 @@ packages = ["src/doc_cache_mcp"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Explicit fleet-standard rule set (matches task-queue-mcp / vikunja-mcp).
+# Pinned so ruff's expanding default select can't leak new rules in on upgrade.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

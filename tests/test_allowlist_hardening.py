@@ -77,9 +77,7 @@ def test_host_prefix_allows_any_path():
 def test_mapped_ipv6_private_rejected():
     # An allowlisted public host that resolves to ::ffff:192.168.1.12 must be refused.
     with pytest.raises(AllowlistError):
-        validate_url(
-            "https://docs.example.com/x", ALLOW, _resolver("::ffff:192.168.1.12")
-        )
+        validate_url("https://docs.example.com/x", ALLOW, _resolver("::ffff:192.168.1.12"))
 
 
 def test_mapped_ipv6_loopback_rejected():
