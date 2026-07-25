@@ -36,11 +36,7 @@ class Settings(BaseSettings):
 
     # Source-URL allowlist data file (git-backed, sysadmin-editable). Default-deny.
     allowlist_path: Path = (
-        Path.home()
-        / "repos"
-        / "gitea"
-        / "host-forge-scripts"
-        / "doc-cache-allowlist.yml"
+        Path.home() / "repos" / "gitea" / "host-forge-scripts" / "doc-cache-allowlist.yml"
     )
 
     # Commit doc-sync.yml to git after a successful add. Set false to stage-only / leave

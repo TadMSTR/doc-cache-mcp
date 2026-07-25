@@ -157,13 +157,7 @@ def test_seeded_allowlist_loads_and_enforces(tmp_path):
     # The real seeded allowlist should load and allow a known host, deny an unknown one.
     from pathlib import Path
 
-    real = (
-        Path.home()
-        / "repos"
-        / "gitea"
-        / "host-forge-scripts"
-        / "doc-cache-allowlist.yml"
-    )
+    real = Path.home() / "repos" / "gitea" / "host-forge-scripts" / "doc-cache-allowlist.yml"
     if not real.exists():
         pytest.skip("seeded allowlist not present")
     al = load_allowlist(real)

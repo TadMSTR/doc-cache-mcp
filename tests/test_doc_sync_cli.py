@@ -17,9 +17,7 @@ pytestmark = pytest.mark.skipif(not DOCSYNC.exists(), reason="doc-sync.py not pr
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location(
-        "forge_doc_sync_regression", str(DOCSYNC)
-    )
+    spec = importlib.util.spec_from_file_location("forge_doc_sync_regression", str(DOCSYNC))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

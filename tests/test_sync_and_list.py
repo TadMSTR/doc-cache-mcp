@@ -13,9 +13,7 @@ class FakeDocSync:
         self.calls = []
 
     def load_config(self):
-        return {
-            "services": {"svc": [{"topic": "overview", "url": "https://x/README.md"}]}
-        }
+        return {"services": {"svc": [{"topic": "overview", "url": "https://x/README.md"}]}}
 
     def load_state(self):
         return {
@@ -50,9 +48,7 @@ class FakeDocSync:
             "errors": 0,
             "indexed": {"indexed": True, "returncode": 0, "timed_out": False},
             "dry_run": False,
-            "results": [
-                {"topic": "overview", "url": "https://x/README.md", "chunks": 3}
-            ],
+            "results": [{"topic": "overview", "url": "https://x/README.md", "chunks": 3}],
         }
 
 

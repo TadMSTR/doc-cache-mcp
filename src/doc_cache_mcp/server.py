@@ -54,12 +54,8 @@ _SYNC_HEARTBEAT_INTERVAL_S = 15
 class DocEntry(BaseModel):
     """One documentation source: a topic label and the https URL to fetch it from."""
 
-    topic: str = Field(
-        description="Short topic slug, e.g. 'overview' or 'docker-install'."
-    )
-    url: str = Field(
-        description="https source URL; must pass the docs-cache allowlist."
-    )
+    topic: str = Field(description="Short topic slug, e.g. 'overview' or 'docker-install'.")
+    url: str = Field(description="https source URL; must pass the docs-cache allowlist.")
 
 
 # ---------------------------------------------------------------------------
@@ -256,9 +252,7 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
         return {"error": "doc-sync.yml 'services' is not a mapping"}
 
     block = services.get(service) or []
-    by_topic = {
-        e["topic"]: dict(e) for e in block if isinstance(e, dict) and "topic" in e
-    }
+    by_topic = {e["topic"]: dict(e) for e in block if isinstance(e, dict) and "topic" in e}
     for ent in clean:
         by_topic[ent["topic"]] = ent
     merged = list(by_topic.values())
@@ -277,7 +271,7 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
     if settings.git_commit:
         try:
             commit = _git_commit_config(real, service)
-        except Exception as e:  # noqa: BLE001 — surface, don't crash the tool
+        except Exception as e:
             log.error("git_commit_error", error=str(e))
             commit = {"committed": False, "error": "git commit error"}
 
@@ -326,9 +320,7 @@ async def _heartbeat(ctx: Context | None, service: str) -> None:
 
 
 @mcp.tool
-async def doc_cache_sync(
-    service: str, dry_run: bool = False, ctx: Context | None = None
-) -> dict:
+async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | None = None) -> dict:
     """Ingest / refresh a configured service into the docs cache.
 
     Fetches each of the service's source URLs, converts + chunks them, writes the chunks
