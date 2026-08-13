@@ -32,6 +32,8 @@ from .allowlist import AllowlistError, load_allowlist, validate_url
 from .config import get_settings
 from .docsync import load_doc_sync
 from .observability import configure_logging, emit_metric, init_tracing
+from .push import identity_args as push_identity_args
+from .push import push_config_commit
 
 configure_logging()
 log = structlog.get_logger()
@@ -92,9 +94,16 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
 
     ``service`` is pre-validated against ``_SERVICE_RE`` so it is safe in the message.
     Returns a small status dict; does not raise for a clean tree (nothing to commit).
+
+    Commits as the tool's own identity rather than as the host user (push.py guard 1), so
+    tool commits are attributable and the foreign-commit guard has something to match on.
+    Passed with ``-c`` per invocation, so this never rewrites the repo's configured
+    identity for anyone else working in the same checkout.
     """
+    settings = get_settings()
     repo = _repo_root(config_path)
     rel = str(config_path.resolve().relative_to(repo))
+    ident = push_identity_args(settings.commit_identity_name, settings.commit_identity_email)
     add = subprocess.run(
         ["git", "-C", str(repo), "add", "--", rel],
         capture_output=True,
@@ -110,6 +119,7 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
             "git",
             "-C",
             str(repo),
+            *ident,
             "commit",
             "-m",
             f"doc-cache: add {service}",
@@ -132,7 +142,36 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
         text=True,
         timeout=10,
     )
-    return {"committed": True, "commit": rev.stdout.strip()}
+    out = {"committed": True, "commit": rev.stdout.strip()}
+
+    # vikunja#363: the commit used to stop here, on local main, permanently — the caller
+    # that asked for it structurally cannot push. Finish the operation under guards.
+    if not settings.git_push:
+        out["pushed"] = False
+        out["reason"] = "push disabled (git_push=false)"
+        return out
+    if settings.deploy_key_path is None:
+        log.error("push_misconfigured", reason="git_push enabled with no deploy_key_path")
+        out["pushed"] = False
+        out["reason"] = "push enabled but no deploy key configured"
+        return out
+
+    out.update(
+        push_config_commit(
+            repo,
+            allowed_path=rel,
+            remote=settings.push_remote,
+            branch=settings.push_branch,
+            identity_email=settings.commit_identity_email,
+            deploy_key=Path(settings.deploy_key_path).expanduser(),
+            review_branch_prefix=settings.review_branch_prefix,
+            audit_dir=(
+                Path(settings.audit_log_dir).expanduser() if settings.audit_log_dir else None
+            ),
+            service=service,
+        )
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------

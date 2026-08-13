@@ -76,6 +76,44 @@ Environment variables (prefix `DOC_CACHE_MCP_`):
 | `DOC_CACHE_MCP_ALLOWLIST_PATH` | `host-forge-scripts/doc-cache-allowlist.yml` | Source-URL allowlist. |
 | `DOC_CACHE_MCP_GIT_COMMIT` | `true` | Commit `doc-sync.yml` after a successful add. |
 | `DOC_CACHE_MCP_MAX_ENTRIES_PER_ADD` | `50` | Ceiling on source entries accepted in one `add_service` call. |
+| `DOC_CACHE_MCP_GIT_PUSH` | `false` | Push that commit. **Off by default** — see below. |
+| `DOC_CACHE_MCP_DEPLOY_KEY_PATH` | unset | ssh key used for the push. Required when `GIT_PUSH` is on. |
+| `DOC_CACHE_MCP_PUSH_REMOTE` / `_PUSH_BRANCH` | `origin` / `main` | Push target. |
+| `DOC_CACHE_MCP_REVIEW_BRANCH_PREFIX` | `doc-cache-mcp/review` | Where a guarded-off commit lands instead. |
+| `DOC_CACHE_MCP_COMMIT_IDENTITY_NAME` / `_EMAIL` | `doc-cache-mcp` / `doc-cache-mcp@forge` | Identity for tool commits. |
+| `DOC_CACHE_MCP_AUDIT_LOG_DIR` | unset | Append-only JSONL sink for push decisions. Unset = no audit events. |
+
+### Pushing
+
+`doc_cache_add_service` commits one file. Without `GIT_PUSH` that commit stays on the
+local branch — which is a problem when the caller is an agent with no git write access of
+its own, because it can never finish what the tool started. The tool reports
+`committed: true` for an operation nobody completes.
+
+Enabling the push means this server writes to a shared branch unattended, so it is off by
+default and guarded when on. Every guard is fail-closed: one that cannot be *evaluated* is
+a refusal, not a pass.
+
+1. Commits are authored as the configured identity, not as the host user.
+2. The push uses `DEPLOY_KEY_PATH` with `IdentitiesOnly=yes`, so ssh cannot fall back to
+   the host user's ambient key. Use a key scoped to the single target repo.
+3. Every commit in `<remote>/<branch>..HEAD` must be authored by that identity — the tool
+   will not sweep up anyone else's unpushed work.
+4. The push range must touch the config file and nothing else.
+5. The config as it will land must be additive against the copy already on the remote: no
+   service or topic removed, no existing URL re-pointed.
+6. Each decision is appended to `AUDIT_LOG_DIR`, giving a trail outside git that survives
+   a force-push.
+7. When a guard trips, the commit is pushed to a **review branch** and the URL to open a
+   pull request is returned — it degrades to human review, never to a stranded local
+   commit or a silent failure.
+
+Note that (5) means re-pointing an existing topic's URL, which `add_service` supports and
+which is otherwise idempotent, will not auto-push; it lands on a review branch instead.
+That is deliberate — a URL swap on an already-cached topic is what cache poisoning would
+look like, and it is worth one human glance.
+
+The deploy key should be mode `0600` and owned by the user the server runs as.
 
 ## Development
 
