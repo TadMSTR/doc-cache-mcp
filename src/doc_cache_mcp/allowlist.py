@@ -8,9 +8,11 @@ add-time and fetch-time policy can never drift:
 * ``doc-sync.py`` enforces it at **fetch time** (every URL, every redirect hop) so the
   ``doc-sync-daily`` cron and ``doc_cache_sync`` are covered.
 
-On forge, ``doc-sync.py`` runs in a separate venv and imports a byte-identical vendored copy
-of this module (``host-forge-scripts/scripts/doc_cache_allowlist.py``); a test asserts the
-two stay in sync. The module depends only on the stdlib + PyYAML so both venvs can import it.
+On forge, ``doc-sync.py`` runs in a separate venv and imports a vendored copy of this module
+(``host-forge-scripts/scripts/doc_cache_allowlist.py``). That copy is **generated** from this
+file by ``python -m doc_cache_mcp.vendoring --write`` — edit here, never there — and a test
+regenerates it to catch drift. The module depends only on the stdlib + PyYAML so both venvs
+can import it.
 
 Policy (default-deny):
 
