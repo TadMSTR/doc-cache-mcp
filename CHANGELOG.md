@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fail-closed guards — one that cannot be *evaluated* refuses rather than passes — and
   degrades to a review branch plus a PR URL rather than failing or stranding the commit.
   See "Pushing" in the README. New module: `doc_cache_mcp.push`.
+
+  Security audit of that module found two Medium issues, both fixed before release: the
+  push sent the `HEAD` *ref* rather than the SHA the guards had inspected, so a commit
+  landing in that window rode along unvalidated (reproduced, then closed by pinning the
+  tip); and an exception from the push subprocess escaped and was relabelled upstream as
+  a commit failure, reporting `committed: false` for a commit that was on disk. A guard
+  that is skipped rather than passed is now reported in `notes` instead of being
+  indistinguishable from a pass.
 - Tool commits are authored as `doc-cache-mcp` rather than as the host user, so they are
   attributable and distinguishable from human commits.
 - Optional JSONL audit sink for push decisions (`DOC_CACHE_MCP_AUDIT_LOG_DIR`) — a trail
