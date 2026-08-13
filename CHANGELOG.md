@@ -4,7 +4,7 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0] — 2026-08-13
 
 ### Added
 - **`doc_cache_add_service` can now finish what it starts** (vikunja#363). It committed
@@ -47,6 +47,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a snapshot from before the edit and no edit could take effect. `load_allowlist()` records
   the source path and load time, and the refusal reports both plus the host count, so "not
   in the file" and "not in the copy I loaded" are no longer indistinguishable.
+- `__version__` said `0.1.0` while `pyproject.toml` said `0.1.1`. `server.py` logs
+  `__version__` at startup, so the running server reported a version it was not. Both are
+  now `0.2.0`, and a parity test reads `pyproject.toml` directly — `importlib.metadata`
+  reflects the last install, so it can pass on an editable venv while the file on disk
+  disagrees, which is the drift this needs to catch.
 
 ## [0.1.1] — 2026-07-07
 
