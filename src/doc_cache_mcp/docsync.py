@@ -1,9 +1,9 @@
 """Load the shared ``doc-sync.py`` logic as the single source of truth.
 
-``doc-sync.py`` lives outside any package (hard-linked into ``~/scripts``) and its name
-contains a hyphen, so it cannot be imported normally. We load it by path once and cache
-the module. The MCP calls its ``sync_service`` / ``load_config`` / ``load_state`` rather
-than re-implementing chunking or shelling out to the script.
+``doc-sync.py`` lives outside any package (in ``host-forge-scripts/scripts``, reached via the
+``~/scripts`` symlink) and its name contains a hyphen, so it cannot be imported normally. We
+load it by path and cache the module. The MCP calls its ``sync_service`` / ``load_config`` /
+``load_state`` rather than re-implementing chunking or shelling out to the script.
 """
 
 from __future__ import annotations

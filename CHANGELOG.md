@@ -4,6 +4,55 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-08-13
+
+### Added
+- **`doc_cache_add_service` can now finish what it starts** (vikunja#363). It committed
+  `doc-sync.yml` to the local branch and stopped, because the agent calling it has no git
+  write access — the very gap this server exists to bridge. `committed: true` therefore
+  described an operation nobody could complete, and the commits accumulated.
+
+  Pushing is **off by default** (`DOC_CACHE_MCP_GIT_PUSH`), because an MCP writing to a
+  shared branch unattended is a real privilege. When enabled it runs behind seven
+  fail-closed guards — one that cannot be *evaluated* refuses rather than passes — and
+  degrades to a review branch plus a PR URL rather than failing or stranding the commit.
+  See "Pushing" in the README. New module: `doc_cache_mcp.push`.
+
+  Security audit of that module found two Medium issues, both fixed before release: the
+  push sent the `HEAD` *ref* rather than the SHA the guards had inspected, so a commit
+  landing in that window rode along unvalidated (reproduced, then closed by pinning the
+  tip); and an exception from the push subprocess escaped and was relabelled upstream as
+  a commit failure, reporting `committed: false` for a commit that was on disk. A guard
+  that is skipped rather than passed is now reported in `notes` instead of being
+  indistinguishable from a pass.
+- Tool commits are authored as `doc-cache-mcp` rather than as the host user, so they are
+  attributable and distinguishable from human commits.
+- Optional JSONL audit sink for push decisions (`DOC_CACHE_MCP_AUDIT_LOG_DIR`) — a trail
+  outside git that survives a force-push.
+- `doc_cache_mcp.vendoring` generates the vendored allowlist copy that `doc-sync.py`
+  imports, replacing a hard link that had silently drifted twice (vikunja#374). A hard
+  link cannot survive an atomic-replace write, and a severed one is indistinguishable from
+  a working one without stat'ing inodes. Regenerate with
+  `python -m doc_cache_mcp.vendoring --write`.
+
+### Fixed
+- **A failed memsearch index no longer reads as a clean sync** (vikunja#372).
+  `doc_cache_sync` returned `errors: 0` beside a healthy chunk count while the index had
+  exited non-zero, leaving the docs cached but unsearchable; the failure was reachable only
+  as `result["indexed"]["returncode"]` and logged at info level with the rest of a
+  successful sync. The result now carries top-level `ok` and `index_error`, the sync logs
+  at error level when the index fails, and an `index_failed` metric is emitted.
+- **Allowlist refusals now say which snapshot refused** (vikunja#374). The message sent the
+  operator to edit a file that already contained the host, because the process was serving
+  a snapshot from before the edit and no edit could take effect. `load_allowlist()` records
+  the source path and load time, and the refusal reports both plus the host count, so "not
+  in the file" and "not in the copy I loaded" are no longer indistinguishable.
+- `__version__` said `0.1.0` while `pyproject.toml` said `0.1.1`. `server.py` logs
+  `__version__` at startup, so the running server reported a version it was not. Both are
+  now `0.2.0`, and a parity test reads `pyproject.toml` directly — `importlib.metadata`
+  reflects the last install, so it can pass on an editable venv while the file on disk
+  disagrees, which is the drift this needs to catch.
+
 ## [0.1.1] — 2026-07-07
 
 ### Fixed

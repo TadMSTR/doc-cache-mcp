@@ -8,9 +8,11 @@ add-time and fetch-time policy can never drift:
 * ``doc-sync.py`` enforces it at **fetch time** (every URL, every redirect hop) so the
   ``doc-sync-daily`` cron and ``doc_cache_sync`` are covered.
 
-On forge, ``doc-sync.py`` runs in a separate venv and imports a byte-identical vendored copy
-of this module (``host-forge-scripts/scripts/doc_cache_allowlist.py``); a test asserts the
-two stay in sync. The module depends only on the stdlib + PyYAML so both venvs can import it.
+On forge, ``doc-sync.py`` runs in a separate venv and imports a vendored copy of this module
+(``host-forge-scripts/scripts/doc_cache_allowlist.py``). That copy is **generated** from this
+file by ``python -m doc_cache_mcp.vendoring --write`` — edit here, never there — and a test
+regenerates it to catch drift. The module depends only on the stdlib + PyYAML so both venvs
+can import it.
 
 Policy (default-deny):
 
@@ -30,6 +32,7 @@ import ipaddress
 import posixpath
 import socket
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -74,7 +77,11 @@ def _ip_is_private(ip: ipaddress._BaseAddress) -> bool:
 def load_allowlist(path) -> dict:
     """Load and normalise the allowlist file.
 
-    Returns ``{"hosts": set[str], "forge_endpoints": list[tuple[host, path_prefix]]}``.
+    Returns ``{"hosts": set[str], "forge_endpoints": list[tuple[host, path_prefix]],
+    "source": str, "loaded_at": str}``. The last two are provenance, not policy: they let a
+    refusal say *which snapshot* refused, so "the host is not in the file" and "this process
+    is holding an old copy of the file" stop looking identical (vikunja#374).
+
     Raises :class:`AllowlistError` if the file is missing or malformed — a missing allowlist
     means *deny everything*, surfaced as an error rather than an open door.
     """
@@ -102,7 +109,37 @@ def load_allowlist(path) -> dict:
         prefix = "/" + prefix if prefix else "/"
         forge_endpoints.append((host, prefix))
 
-    return {"hosts": hosts, "forge_endpoints": forge_endpoints}
+    return {
+        "hosts": hosts,
+        "forge_endpoints": forge_endpoints,
+        "source": str(path),
+        "loaded_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+
+
+def _snapshot_hint(allowlist: dict) -> str:
+    """Describe the snapshot that refused a host, so a stale one is recognisable.
+
+    The old refusal said only "Add it to doc-cache-allowlist.yml", which sent the operator
+    to edit a file that already contained the host: the server had memoised the allowlist
+    for the life of the process, so no edit could ever take effect (vikunja#374). Naming
+    the file, the load time and the host count makes the two cases tell themselves apart
+    without anyone having to guess.
+
+    Degrades gracefully for a hand-built allowlist dict with no provenance (tests, and any
+    caller that assembles one directly).
+    """
+    source = allowlist.get("source")
+    if not source:
+        return "Add it to doc-cache-allowlist.yml (sysadmin) to cache from it."
+    loaded_at = allowlist.get("loaded_at")
+    when = f", loaded {loaded_at}" if loaded_at else ""
+    count = len(allowlist.get("hosts") or ())
+    return (
+        f"This used {source}{when} ({count} hosts). If the host is ALREADY in that file, "
+        "this process is serving a stale snapshot — report that as a bug rather than "
+        "editing the file again. Otherwise add it (sysadmin) to cache from it."
+    )
 
 
 def _path_matches_prefix(url_path: str, prefix: str) -> bool:
@@ -182,7 +219,7 @@ def validate_url(url: str, allowlist: dict, resolver: Resolver | None = None) ->
     if host not in allowlist.get("hosts", set()):
         raise AllowlistError(
             f"host {host!r} is not on the docs-cache allowlist (default-deny). "
-            "Add it to doc-cache-allowlist.yml (sysadmin) to cache from it."
+            + _snapshot_hint(allowlist)
         )
     _assert_resolves_public(host, resolver)
     return url

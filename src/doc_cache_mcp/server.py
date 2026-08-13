@@ -32,6 +32,8 @@ from .allowlist import AllowlistError, load_allowlist, validate_url
 from .config import get_settings
 from .docsync import load_doc_sync
 from .observability import configure_logging, emit_metric, init_tracing
+from .push import identity_args as push_identity_args
+from .push import push_config_commit
 
 configure_logging()
 log = structlog.get_logger()
@@ -92,9 +94,16 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
 
     ``service`` is pre-validated against ``_SERVICE_RE`` so it is safe in the message.
     Returns a small status dict; does not raise for a clean tree (nothing to commit).
+
+    Commits as the tool's own identity rather than as the host user (push.py guard 1), so
+    tool commits are attributable and the foreign-commit guard has something to match on.
+    Passed with ``-c`` per invocation, so this never rewrites the repo's configured
+    identity for anyone else working in the same checkout.
     """
+    settings = get_settings()
     repo = _repo_root(config_path)
     rel = str(config_path.resolve().relative_to(repo))
+    ident = push_identity_args(settings.commit_identity_name, settings.commit_identity_email)
     add = subprocess.run(
         ["git", "-C", str(repo), "add", "--", rel],
         capture_output=True,
@@ -110,6 +119,7 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
             "git",
             "-C",
             str(repo),
+            *ident,
             "commit",
             "-m",
             f"doc-cache: add {service}",
@@ -132,7 +142,36 @@ def _git_commit_config(config_path: Path, service: str) -> dict:
         text=True,
         timeout=10,
     )
-    return {"committed": True, "commit": rev.stdout.strip()}
+    out = {"committed": True, "commit": rev.stdout.strip()}
+
+    # vikunja#363: the commit used to stop here, on local main, permanently — the caller
+    # that asked for it structurally cannot push. Finish the operation under guards.
+    if not settings.git_push:
+        out["pushed"] = False
+        out["reason"] = "push disabled (git_push=false)"
+        return out
+    if settings.deploy_key_path is None:
+        log.error("push_misconfigured", reason="git_push enabled with no deploy_key_path")
+        out["pushed"] = False
+        out["reason"] = "push enabled but no deploy key configured"
+        return out
+
+    out.update(
+        push_config_commit(
+            repo,
+            allowed_path=rel,
+            remote=settings.push_remote,
+            branch=settings.push_branch,
+            identity_email=settings.commit_identity_email,
+            deploy_key=Path(settings.deploy_key_path).expanduser(),
+            review_branch_prefix=settings.review_branch_prefix,
+            audit_dir=(
+                Path(settings.audit_log_dir).expanduser() if settings.audit_log_dir else None
+            ),
+            service=service,
+        )
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +252,8 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
         return {"error": f"too many entries (max {settings.max_entries_per_add})"}
 
     # Load the allowlist fresh each call so sysadmin edits take effect without a restart.
+    # doc-sync.py's fetch-time guard now does the same, keyed on the allowlist file's stat
+    # identity (vikunja#374), so add-time and fetch-time agree on what "current" means.
     try:
         allowlist = load_allowlist(settings.allowlist_path)
     except AllowlistError as e:
@@ -333,6 +374,11 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
     notifications are sent every 15s while it runs so MCP clients don't treat the call as
     hung; raise your client-side timeout if it doesn't support progress notifications.
 
+    Check ``ok`` before trusting a sync. It is false if any source failed to fetch OR the
+    memsearch index failed; ``index_error`` carries the reason for the latter. An index
+    failure means the docs are cached but not searchable, which ``entries_synced`` and
+    ``chunks`` on their own will happily describe as a success.
+
     Args:
         service: Service key to sync (must exist in doc-sync.yml).
         dry_run: If true, report what would be synced without fetching or writing.
@@ -360,13 +406,20 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
             await heartbeat
     duration = round(time.perf_counter() - t0, 3)
 
-    log.info(
+    # A failed memsearch index used to be visible only as result["indexed"]["returncode"],
+    # sitting next to errors: 0 and a healthy-looking chunk count (vikunja#372). Promote it
+    # so a caller reading the summary cannot miss it, and log it at error level.
+    index_error = result.get("index_error")
+    log_event = log.error if index_error else log.info
+    log_event(
         "doc_cache_sync",
         service=service,
         dry_run=dry_run,
+        ok=result.get("ok"),
         entries_synced=result.get("entries_synced"),
         chunks=result.get("chunks"),
         errors=result.get("errors"),
+        index_error=index_error,
         duration_s=duration,
     )
     emit_metric(
@@ -376,6 +429,7 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
             "entries_synced": result.get("entries_synced", 0),
             "chunks": result.get("chunks", 0),
             "errors": result.get("errors", 0),
+            "index_failed": 1 if index_error else 0,
             "duration_s": duration,
         },
     )
