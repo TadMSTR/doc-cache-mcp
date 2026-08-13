@@ -38,6 +38,8 @@ class FakeDocSync:
                 "chunks": 0,
                 "errors": 0,
                 "indexed": None,
+                "index_error": None,
+                "ok": True,
                 "dry_run": True,
                 "results": [],
             }
@@ -46,10 +48,29 @@ class FakeDocSync:
             "entries_synced": 1,
             "chunks": 3,
             "errors": 0,
-            "indexed": {"indexed": True, "returncode": 0, "timed_out": False},
+            "indexed": {"indexed": True, "returncode": 0, "timed_out": False, "error": None},
+            "index_error": None,
+            "ok": True,
             "dry_run": False,
             "results": [{"topic": "overview", "url": "https://x/README.md", "chunks": 3}],
         }
+
+
+class IndexFailsDocSync(FakeDocSync):
+    """The shape actually reported in vikunja#372: docs written, index exited 1."""
+
+    def sync_service(self, service, *, force=False, dry_run=False, index=True):
+        r = super().sync_service(service, force=force, dry_run=dry_run, index=index)
+        r["indexed"] = {
+            "indexed": False,
+            "returncode": 1,
+            "timed_out": False,
+            "error": "memsearch index exited 1 — docs are cached but NOT searchable "
+            "until an index succeeds",
+        }
+        r["index_error"] = r["indexed"]["error"]
+        r["ok"] = False
+        return r
 
 
 @pytest.fixture
@@ -66,6 +87,30 @@ async def test_sync_ok(fake_ds):
     assert r["indexed"]["indexed"] is True
     assert "duration_s" in r
     assert fake_ds.calls == [("svc", False, True)]
+
+
+async def test_sync_ok_is_true_on_a_clean_run(fake_ds):
+    r = await server.doc_cache_sync("svc")
+    assert r["ok"] is True
+    assert r["index_error"] is None
+
+
+async def test_sync_surfaces_index_failure_at_top_level(monkeypatch):
+    """vikunja#372: `errors: 0` beside a failed index read as a clean success.
+
+    The failure was reachable only by drilling into result["indexed"]["returncode"], one
+    level below the summary fields callers actually read.
+    """
+    monkeypatch.setattr(server, "load_doc_sync", lambda: IndexFailsDocSync())
+    r = await server.doc_cache_sync("svc")
+
+    assert r["ok"] is False, "a failed index still reports overall success"
+    assert r["index_error"], "index failure has no top-level field"
+    assert "NOT searchable" in r["index_error"]
+
+    # The per-entry error count keeps its own meaning — the fetches really did succeed.
+    assert r["errors"] == 0
+    assert r["chunks"] == 3
 
 
 async def test_sync_dry_run_does_not_index(fake_ds):

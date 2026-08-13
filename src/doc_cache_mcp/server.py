@@ -335,6 +335,11 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
     notifications are sent every 15s while it runs so MCP clients don't treat the call as
     hung; raise your client-side timeout if it doesn't support progress notifications.
 
+    Check ``ok`` before trusting a sync. It is false if any source failed to fetch OR the
+    memsearch index failed; ``index_error`` carries the reason for the latter. An index
+    failure means the docs are cached but not searchable, which ``entries_synced`` and
+    ``chunks`` on their own will happily describe as a success.
+
     Args:
         service: Service key to sync (must exist in doc-sync.yml).
         dry_run: If true, report what would be synced without fetching or writing.
@@ -362,13 +367,20 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
             await heartbeat
     duration = round(time.perf_counter() - t0, 3)
 
-    log.info(
+    # A failed memsearch index used to be visible only as result["indexed"]["returncode"],
+    # sitting next to errors: 0 and a healthy-looking chunk count (vikunja#372). Promote it
+    # so a caller reading the summary cannot miss it, and log it at error level.
+    index_error = result.get("index_error")
+    log_event = log.error if index_error else log.info
+    log_event(
         "doc_cache_sync",
         service=service,
         dry_run=dry_run,
+        ok=result.get("ok"),
         entries_synced=result.get("entries_synced"),
         chunks=result.get("chunks"),
         errors=result.get("errors"),
+        index_error=index_error,
         duration_s=duration,
     )
     emit_metric(
@@ -378,6 +390,7 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
             "entries_synced": result.get("entries_synced", 0),
             "chunks": result.get("chunks", 0),
             "errors": result.get("errors", 0),
+            "index_failed": 1 if index_error else 0,
             "duration_s": duration,
         },
     )
