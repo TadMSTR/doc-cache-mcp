@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import uuid
 from datetime import UTC, datetime
@@ -64,6 +65,19 @@ import yaml
 log = structlog.get_logger()
 
 _GIT_TIMEOUT_S = 60
+
+
+#: ``service`` reaches a git ref name in :func:`_degrade`. server.py validates it before
+#: calling, but the guard is repeated here rather than assumed: this is an exported
+#: function, and a validation that lives only at one call site is one refactor away from
+#: not running at all (IV-01).
+#:
+#: Stricter than server.py's ``_SERVICE_RE`` in one respect: a leading ``-`` is refused.
+#: ``^[A-Za-z0-9_-]+$`` admits ``--force``, which is a legal service name today but reads
+#: as an option anywhere it is not carefully positioned. Nothing here puts it in such a
+#: position and none of the 63 configured services starts with a dash, so this costs
+#: nothing and removes the question.
+_SAFE_SERVICE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 
 
 class PushRefused(Exception):
@@ -153,19 +167,35 @@ def _ssh_command(deploy_key: Path) -> str:
     )
 
 
+#: Environment git is given. An explicit allowlist rather than ``dict(os.environ)``
+#: (SC-06): this process is a long-lived daemon whose environment accumulates whatever the
+#: deployment puts there, and git spawns ssh, which reads it.
+#:
+#: SSH_AUTH_SOCK is deliberately absent. ``IdentitiesOnly=yes`` already stops ssh offering
+#: unrelated agent identities, but withholding the socket entirely means the deploy key is
+#: the only credential that *can* be used — guard 2 then holds structurally rather than by
+#: correct option handling. Same reasoning for any ambient forge token: git has no use for
+#: one over ssh, so it does not get one.
+_GIT_ENV_ALLOWLIST = ("HOME", "PATH", "LANG", "LC_ALL", "TZ", "GIT_CONFIG_GLOBAL")
+
+
+def _git_env(deploy_key: Path | None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOWLIST}
+    if deploy_key is not None:
+        env["GIT_SSH_COMMAND"] = _ssh_command(deploy_key)
+    return env
+
+
 def _git(
     repo: Path, args: list[str], deploy_key: Path | None = None
 ) -> subprocess.CompletedProcess:
-    """Run git with a fixed argv. Never a shell."""
-    env = dict(os.environ)
-    if deploy_key is not None:
-        env["GIT_SSH_COMMAND"] = _ssh_command(deploy_key)
+    """Run git with a fixed argv and a minimal environment. Never a shell."""
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
         timeout=_GIT_TIMEOUT_S,
-        env=env,
+        env=_git_env(deploy_key),
     )
 
 
@@ -369,6 +399,9 @@ def push_config_commit(
     Returns the ``commit`` sub-dict fields describing what happened — always including
     ``pushed``, and on degradation a ``reason`` plus the branch and PR URL.
     """
+    if not _SAFE_SERVICE.match(service or ""):
+        return {"pushed": False, "reason": f"invalid service name {service!r}"}
+
     if not deploy_key.exists():
         return {
             "pushed": False,

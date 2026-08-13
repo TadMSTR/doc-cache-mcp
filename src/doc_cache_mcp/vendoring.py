@@ -26,6 +26,7 @@ The vendored copy lives in a different repo (``host-forge/scripts``) — commit 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -85,7 +86,17 @@ def write_vendored(dest: Path | None = None) -> tuple[Path, bool]:
     rendered = render_vendored()
     if dest.exists() and dest.read_text(encoding="utf-8") == rendered:
         return dest, False
-    dest.write_text(rendered, encoding="utf-8")
+
+    # Write-then-rename (FW-01). A torn write here would leave doc-sync.py importing a
+    # syntactically broken allowlist — which fails closed, but noisily and at 03:00.
+    #
+    # Note the irony: atomic replace is what severed the hard link this generator
+    # replaced. That is no longer a hazard precisely because there is no link to sever —
+    # the whole point of generating the file is that its identity does not matter, only
+    # its contents.
+    tmp = dest.with_name(dest.name + ".tmp")
+    tmp.write_text(rendered, encoding="utf-8")
+    os.replace(tmp, dest)
     return dest, True
 
 

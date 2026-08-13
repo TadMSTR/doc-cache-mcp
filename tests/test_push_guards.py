@@ -248,6 +248,39 @@ def test_unevaluable_range_refuses_rather_than_pushing(repo):
         )
 
 
+@pytest.mark.parametrize(
+    "bad", ["../../etc", "svc; rm -rf /", "svc name", "--force", "", "refs/heads/main"]
+)
+def test_hostile_service_name_is_refused_before_it_reaches_a_ref(repo, bad):
+    """IV-01. server.py validates first, but this is an exported function.
+
+    ``service`` is interpolated into a branch name on the degradation path, so a name that
+    escapes the intended namespace must not get that far.
+    """
+    out = _push(repo, service=bad)
+    assert out["pushed"] is False
+    assert "invalid service name" in out["reason"]
+
+
+def test_git_env_withholds_the_ssh_agent_socket():
+    """Guard 2 should hold structurally, not only via IdentitiesOnly.
+
+    If the agent socket reached ssh, a loaded key could satisfy the connection even though
+    the whole point of the deploy key is to bound what this service can reach.
+    """
+    from doc_cache_mcp.push import _git_env
+
+    env = _git_env(Path("/tmp/key"))
+    assert "SSH_AUTH_SOCK" not in env
+    assert env["GIT_SSH_COMMAND"].startswith("ssh -i /tmp/key")
+    assert "IdentitiesOnly=yes" in env["GIT_SSH_COMMAND"]
+    # No ambient forge credentials ride along to git or its ssh child.
+    leaky = [
+        k for k in env if k != "GIT_SSH_COMMAND" and ("TOKEN" in k.upper() or "KEY" in k.upper())
+    ]
+    assert not leaky, leaky
+
+
 def test_nothing_to_push_is_reported_plainly(repo):
     out = _push(repo)
     assert out["pushed"] is False
