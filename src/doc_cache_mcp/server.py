@@ -213,6 +213,8 @@ def doc_cache_add_service(service: str, entries: list[DocEntry]) -> dict:
         return {"error": f"too many entries (max {settings.max_entries_per_add})"}
 
     # Load the allowlist fresh each call so sysadmin edits take effect without a restart.
+    # doc-sync.py's fetch-time guard now does the same, keyed on the allowlist file's stat
+    # identity (vikunja#374), so add-time and fetch-time agree on what "current" means.
     try:
         allowlist = load_allowlist(settings.allowlist_path)
     except AllowlistError as e:
