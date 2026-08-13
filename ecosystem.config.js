@@ -15,6 +15,12 @@ module.exports = {
       DOC_CACHE_MCP_DOCSYNC_PATH: "/home/ted/scripts/doc-sync.py",
       DOC_CACHE_MCP_CONFIG_PATH: "/home/ted/docs/doc-sync.yml",
       DOC_CACHE_MCP_ALLOWLIST_PATH: "/home/ted/repos/gitea/host-forge-scripts/doc-cache-allowlist.yml",
+      // Push capability (vikunja#363) — enabled 2026-08-13 so research can
+      // complete docs-cache preflights unaided. Deploy key is write-scoped
+      // to host-forge/scripts only.
+      DOC_CACHE_MCP_GIT_PUSH: "true",
+      DOC_CACHE_MCP_DEPLOY_KEY_PATH: "/home/ted/.secrets/doc-cache-mcp-deploy",
+      DOC_CACHE_MCP_AUDIT_LOG_DIR: "/home/ted/.claude/comms/logs",
       // Optional telemetry (off unless set):
       // OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:4317",
     },
