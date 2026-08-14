@@ -85,14 +85,17 @@ Environment variables (prefix `DOC_CACHE_MCP_`):
 
 ### Pushing
 
+> **`DOC_CACHE_MCP_GIT_PUSH` is `false` by default. Turning it on gives this MCP
+> unattended write access to a shared repo's `main`.** Only enable it if you have read
+> the seven guards below and provisioned a scoped deploy key.
+
 `doc_cache_add_service` commits one file. Without `GIT_PUSH` that commit stays on the
 local branch — which is a problem when the caller is an agent with no git write access of
 its own, because it can never finish what the tool started. The tool reports
 `committed: true` for an operation nobody completes.
 
-Enabling the push means this server writes to a shared branch unattended, so it is off by
-default and guarded when on. Every guard is fail-closed: one that cannot be *evaluated* is
-a refusal, not a pass.
+Enabling the push means this server writes to a shared branch unattended. Every guard
+below is fail-closed: one that cannot be *evaluated* is a refusal, not a pass.
 
 1. Commits are authored as the configured identity, not as the host user.
 2. The push uses `DEPLOY_KEY_PATH` with `IdentitiesOnly=yes`, so ssh cannot fall back to
