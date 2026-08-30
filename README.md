@@ -145,6 +145,19 @@ with `pip install ".[telemetry]"`.
 | `INFLUXDB_TOKEN` | Auth token for the InfluxDB backend. |
 | `INFLUXDB_BUCKET` | Target database/bucket (default `doc-cache-mcp`). |
 
+### Failure behaviour
+
+Metric emission is best-effort and never fails a tool call, but it is **not silent**. An
+unset `INFLUXDB_URL` is the intended disabled state and logs nothing. A backend that is
+*configured and failing* warns exactly once per process:
+
+| Event | Meaning |
+|-------|---------|
+| `influx_init_failed` | `INFLUXDB_URL` is set but the client could not be built (usually the `[telemetry]` extra is missing). Writes are disabled for the process and not retried. |
+| `influx_write_failed` | The client built but a write failed. This — not `influx_init_failed` — is what a wrong or unreachable `INFLUXDB_URL` looks like, because `InfluxDBClient3` connects lazily and so builds successfully against any host. Writes keep being attempted, since a write failure is often transient. |
+
+Both carry the exception *class* only, never the URL or the token.
+
 ## License
 
 MIT
