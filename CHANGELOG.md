@@ -4,6 +4,53 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-08-30
+
+Telemetry that fails is now visible. Ports the InfluxDB half of the fixes proven in
+dockhand-mcp v0.4.0 (TadMSTR/dockhand-mcp#6) — vikunja#575 item 3, #580.
+
+Verified against a **genuinely dead backend**, not mocks: both of the defects in #580 were
+invisible to mocked tests. Measured on 2026-08-30 with `INFLUXDB_URL=http://127.0.0.1:9/nope`,
+five `emit_metric` calls produced **0** log lines before this change and exactly **1** after.
+
+### Fixed
+- **A configured-but-failing InfluxDB was completely silent** — `_get_influx()` swallowed
+  every exception with `except Exception: pass`, leaving the client global at `None`, so
+  nothing in the logs ever mentioned the broken backend and every subsequent `emit_metric()`
+  re-entered the connect path. It now warns once and sets a negative-cache sentinel. An
+  *unset* `INFLUXDB_URL` remains the intended disabled state and stays silent — "never tried"
+  and "tried and failed" are distinct flags, not an overloaded `None`.
+- **The write path was the half that actually mattered** (#580). `InfluxDBClient3` constructs
+  lazily and never contacts the host, so against an unreachable URL `_get_influx()`
+  *succeeds* and an init-only sentinel never fires — verified live against
+  `http://127.0.0.1:9/nope`, where the client built fine and every `write()` raised
+  `NewConnectionError` into a bare `except Exception: pass`. `emit_metric` now warns once on
+  a failed write while continuing to attempt them, since a write failure is often transient.
+
+### Security
+- The new warnings carry the exception *class* only, never `str(exc)`, the URL or the token —
+  an InfluxDB error can echo either. `exc_info=True` is kept **only** on `otel_init_failed`,
+  whose config is a bare endpoint URL with no credential and whose try block spans five
+  imports plus an exporter build; a test pins that exemption set at exactly one site. This
+  follows the dockhand-mcp audit split from 2026-08-29 (LOW-1).
+
+### Unchanged, deliberately
+- **No third-party logger demotion.** dockhand-mcp and backrest-mcp needed one because they
+  route stdlib logging through a root handler at `LOG_LEVEL`, so `httpx`/`mcp`/`nats`
+  inherited it and drowned the app's own lines. This server's `configure_logging()` is
+  `structlog.configure()` with a `PrintLoggerFactory` — no root `setLevel`, no stdlib
+  handler — and its logs contain zero `"logger":` keys, confirming nothing routes through
+  stdlib. Adding a demotion here would be a change with no defect behind it.
+  `test_configure_logging_does_not_touch_stdlib_logging` pins that premise, so if the
+  logging setup ever moves to stdlib routing, the test says so.
+
+### Tests
+- New `tests/test_observability.py` — 11 tests covering the init sentinel, the write
+  warning, the lazy-client mechanism behind #580, and the no-credential-in-logs rule.
+  `influxdb_client_3` is faked via `sys.modules` rather than imported, because CI installs
+  only `.[dev]` — a test that needed the real package would skip exactly where it matters
+  most.
+
 ## [0.2.0] — 2026-08-13
 
 ### Added

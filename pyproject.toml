@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "doc-cache-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Capability-scoped FastMCP server for the forge documentation cache (list/add/sync + source-URL allowlist)"
 readme = "README.md"
 license = { text = "MIT" }
