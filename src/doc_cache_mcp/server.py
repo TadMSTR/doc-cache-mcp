@@ -46,10 +46,10 @@ _SERVICE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # so it can never break out of the frontmatter block or the tags list.
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MAX_URL_LEN = 2048
-# How often doc_cache_sync reports progress while the (blocking) memsearch index step
-# runs. Some MCP clients treat a long gap with no response/progress as a hung call and
-# abort — a full-corpus reindex can take several minutes, so a heartbeat well under any
-# realistic idle-timeout keeps the call alive without changing what actually runs.
+# How often doc_cache_sync reports progress while the (blocking) sync runs. Some MCP
+# clients treat a long gap with no response/progress as a hung call and abort — a service
+# with many source URLs is fetched one at a time (30s timeout each), so a heartbeat well
+# under any realistic idle-timeout keeps the call alive without changing what actually runs.
 _SYNC_HEARTBEAT_INTERVAL_S = 15
 
 
@@ -353,10 +353,7 @@ async def _heartbeat(ctx: Context | None, service: str) -> None:
         await ctx.report_progress(
             progress=elapsed,
             total=None,
-            message=(
-                f"syncing {service}: {elapsed}s elapsed — a full-corpus memsearch "
-                "reindex can take several minutes"
-            ),
+            message=f"syncing {service}: {elapsed}s elapsed — fetching sources",
         )
 
 
@@ -365,19 +362,19 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
     """Ingest / refresh a configured service into the docs cache.
 
     Fetches each of the service's source URLs, converts + chunks them, writes the chunks
-    to the cache, updates state, and (unless ``dry_run``) indexes the cache into memsearch
-    so the new docs are searchable. The service must already exist in the config — add it
+    to the cache and updates state. The service must already exist in the config — add it
     first with ``doc_cache_add_service``.
 
-    The memsearch step reindexes the whole docs cache (not just this service), so a sync
-    can take several minutes even when only one small entry changed. Progress
-    notifications are sent every 15s while it runs so MCP clients don't treat the call as
-    hung; raise your client-side timeout if it doesn't support progress notifications.
+    The new docs are cached immediately and become searchable in qmd's ``docs`` collection
+    after the next hourly ``qmd-refresh`` (at :00). This tool does not index anything.
 
-    Check ``ok`` before trusting a sync. It is false if any source failed to fetch OR the
-    memsearch index failed; ``index_error`` carries the reason for the latter. An index
-    failure means the docs are cached but not searchable, which ``entries_synced`` and
-    ``chunks`` on their own will happily describe as a success.
+    Progress notifications are sent every 15s while a sync runs so MCP clients don't treat
+    a slow fetch as a hung call; raise your client-side timeout if yours doesn't support
+    progress notifications.
+
+    Check ``ok`` before trusting a sync. It is false if any source failed to fetch
+    (``errors`` counts them). If the underlying doc-sync still reports an index step,
+    an ``index_error`` from it is surfaced at the top level and also makes ``ok`` false.
 
     Args:
         service: Service key to sync (must exist in doc-sync.yml).
@@ -391,9 +388,9 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
     t0 = time.perf_counter()
     heartbeat = asyncio.create_task(_heartbeat(ctx, service))
     try:
-        # sync_service (fetch + chunk + the blocking memsearch subprocess) is synchronous
-        # doc-sync logic shared with the CLI cron — run it off the event loop so the
-        # heartbeat task above can actually keep ticking while it's in flight.
+        # sync_service (fetch + chunk + write) is synchronous doc-sync logic shared with
+        # the CLI cron — run it off the event loop so the heartbeat task above can actually
+        # keep ticking while it's in flight.
         result = await asyncio.to_thread(ds.sync_service, service, dry_run=dry_run)
     except ValueError as e:  # unknown service — safe, useful message (no paths)
         return {"error": str(e)}
@@ -406,34 +403,58 @@ async def doc_cache_sync(service: str, dry_run: bool = False, ctx: Context | Non
             await heartbeat
     duration = round(time.perf_counter() - t0, 3)
 
-    # A failed memsearch index used to be visible only as result["indexed"]["returncode"],
-    # sitting next to errors: 0 and a healthy-looking chunk count (vikunja#372). Promote it
-    # so a caller reading the summary cannot miss it, and log it at error level.
+    result = _normalise_sync_result(result)
     index_error = result.get("index_error")
-    log_event = log.error if index_error else log.info
+    log_event = log.error if index_error or not result["ok"] else log.info
     log_event(
         "doc_cache_sync",
         service=service,
         dry_run=dry_run,
-        ok=result.get("ok"),
+        ok=result["ok"],
         entries_synced=result.get("entries_synced"),
         chunks=result.get("chunks"),
         errors=result.get("errors"),
         index_error=index_error,
         duration_s=duration,
     )
-    emit_metric(
-        "doc_cache_tool",
-        {"tool": "sync", "service": service},
-        {
-            "entries_synced": result.get("entries_synced", 0),
-            "chunks": result.get("chunks", 0),
-            "errors": result.get("errors", 0),
-            "index_failed": 1 if index_error else 0,
-            "duration_s": duration,
-        },
-    )
+    fields = {
+        "entries_synced": result.get("entries_synced", 0),
+        "chunks": result.get("chunks", 0),
+        "errors": result.get("errors", 0),
+        "duration_s": duration,
+    }
+    # Only a doc-sync that still has an index step can report on it. Emitting a constant
+    # 0 after that step is gone would read as "indexing is healthy" on a dashboard.
+    if _reports_index(result):
+        fields["index_failed"] = 1 if index_error else 0
+    emit_metric("doc_cache_tool", {"tool": "sync", "service": service}, fields)
     result["duration_s"] = duration
+    return result
+
+
+def _reports_index(result: dict) -> bool:
+    return "indexed" in result or "index_error" in result
+
+
+def _normalise_sync_result(result: dict) -> dict:
+    """Make ``ok`` trustworthy whether or not doc-sync still runs an index step.
+
+    doc-sync.py's memsearch index step is being removed (memsearch-retirement-finish-2026-09
+    part 2; qmd-refresh indexes the docs cache hourly). Until then its result carries
+    ``indexed`` / ``index_error``; afterwards neither key exists. Both shapes must report
+    a clean sync as ``ok: true`` (vikunja#921).
+
+    * ``ok`` from doc-sync is passed through when present. Only when it is missing is it
+      derived: no fetch errors and no ``index_error``.
+    * ``index_error``, when doc-sync reports one, still makes ``ok`` false (vikunja#372):
+      a failure one level down must not sit beside a summary that claims success.
+    * No index keys are invented for a doc-sync that doesn't report them.
+    """
+    index_error = result.get("index_error")
+    ok = result.get("ok")
+    if ok is None:
+        ok = not result.get("errors") and not index_error
+    result["ok"] = bool(ok) and not index_error
     return result
 
 

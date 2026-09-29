@@ -31,7 +31,7 @@ validation as a first-class control.
 |------|-----------|
 | `doc_cache_list_services()` | Read-only. Lists each configured service, its topics/URLs, chunk counts, and last-synced date. |
 | `doc_cache_add_service(service, entries)` | Registers a service + `[{topic, url}]`. **Validates every URL against the allowlist**, then does a structural YAML merge (dedup by topic), atomic write, and single-file git commit. Never fetches. |
-| `doc_cache_sync(service, dry_run=False)` | Ingests/refreshes a configured service: fetch → convert → chunk → cache → index into memsearch. Service must already exist in config. |
+| `doc_cache_sync(service, dry_run=False)` | Ingests/refreshes a configured service: fetch → convert → chunk → cache. Service must already exist in config. The docs become searchable in qmd's `docs` collection after the next hourly `qmd-refresh` (at :00). `ok` is false if any source failed to fetch, or if doc-sync reports an `index_error`. |
 
 ## Source-URL allowlist (the security core)
 

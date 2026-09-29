@@ -31,11 +31,13 @@ def test_importable_api_present():
         "load_state",
         "state_lock",
         "_sync_service_entries",
-        "run_memsearch_index",
     ):
         assert hasattr(m, name), f"missing {name}"
+    # Only what doc-cache-mcp calls. The `index` kwarg and run_memsearch_index are not
+    # asserted: the server never passes `index` (it calls sync_service(service,
+    # dry_run=...)), and memsearch-retirement-finish-2026-09 part 2 removes both.
     sig = inspect.signature(m.sync_service)
-    assert set(["force", "dry_run", "index"]).issubset(sig.parameters)
+    assert {"force", "dry_run"}.issubset(sig.parameters)
 
 
 def test_cli_help_still_works():

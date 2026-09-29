@@ -28,8 +28,10 @@ of the edit, not its *content*, so it had nowhere to enforce this.
 2. **No arbitrary execution.** The server exposes three typed verbs. It has no
    `run_command`/`read_file`/`edit_file` surface. The only subprocess calls are:
    - the fixed-argv `git add`/`commit` of the single config file, and
-   - the fixed-argv memsearch index (inherited from `doc-sync.py`, unchanged).
-   Neither uses a shell; both use list argv.
+   - whatever fixed-argv subprocess the imported `doc-sync.py` runs. Until
+     memsearch-retirement-finish-2026-09 part 2 lands that is `memsearch index`; after it,
+     none.
+   None uses a shell; all use list argv.
 
 3. **Typed, validated params.** `service` matches `^[A-Za-z0-9_-]+$`; `topic` matches
    `^[A-Za-z0-9._-]+$` (so it cannot break out of the YAML frontmatter block or the tags

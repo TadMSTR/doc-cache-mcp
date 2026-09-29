@@ -27,6 +27,12 @@ grant (ADR-0005) with three verbs + a source-URL allowlist.
 `pytest`. Cover allowlist bypass cases, YAML merge/dedup idempotence, dry-run,
 unknown-service, and the doc-sync CLI regression.
 
+Tests that load the live `~/scripts/doc-sync.py` skip off-forge, including in GitHub CI.
+`tests/fixtures/doc_sync_indexfree.py` is a copy of that script without its memsearch
+index step, loaded through the real `load_doc_sync()` so CI exercises a real doc-sync.
+A forge-local test fails if it stops mirroring the live script; re-copy it then, and don't
+reformat it (ruff excludes `tests/fixtures`).
+
 ## Deploy
 
 PM2 on `127.0.0.1:8503` (`ecosystem.config.js`). Manifest cutover (removing research's
