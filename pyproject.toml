@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "doc-cache-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Capability-scoped FastMCP server for the forge documentation cache (list/add/sync + source-URL allowlist)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -56,6 +56,9 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
+# A verbatim copy of host-forge-scripts' doc-sync.py (less its index step) — kept in that
+# repo's style so it can be diffed against the live script, not reformatted into this one.
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 # Explicit fleet-standard rule set (matches task-queue-mcp / vikunja-mcp).

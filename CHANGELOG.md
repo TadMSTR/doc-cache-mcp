@@ -4,6 +4,47 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] — 2026-09-29
+
+doc-cache-mcp no longer depends on doc-sync.py's memsearch index step (vikunja#921). This is
+memsearch-retirement-finish-2026-09 part 1. Part 2 removes that step from doc-sync.py.
+
+### Fixed
+- **A clean sync is `ok: true` whether or not doc-sync still has an index step.** memsearch
+  was retired on 2026-09-17, so every `doc_cache_sync` has since returned `ok: false` with
+  `index_error: "memsearch index exited 1 — docs are cached but NOT searchable…"`. Neither
+  half was true: the docs were cached, and qmd-refresh indexes `~/.claude/memory/docs/`
+  every hour. The server now treats `indexed` / `index_error` as optional. `ok` from
+  doc-sync is passed through, and derived from `errors` only when doc-sync omits it. An
+  `index_error`, when doc-sync reports one, still clears `ok` (vikunja#372).
+  - The live result keeps today's `index_error` until part 2 lands. This release makes the
+    server correct for both shapes. It doesn't change what the current doc-sync returns.
+- **The tool description and progress message no longer talk about memsearch.** They say
+  the docs are cached and become searchable in qmd after the next hourly `qmd-refresh`.
+
+### Changed
+- **The `index_failed` metric is emitted only when doc-sync reports an index result.**
+  After part 2 it disappears from `doc_cache_tool` points for `tool=sync`, rather than
+  sitting at a constant 0 that reads as healthy indexing. Dashboards that plot it will
+  stop getting new points.
+- A sync with fetch errors now logs `doc_cache_sync` at error level. Before, only an index
+  failure did, and a sync with every source failing logged at info.
+
+### Tests
+- **CI now runs doc_cache_sync against a real doc-sync.py.** Every test that loaded
+  `~/scripts/doc-sync.py` skipped in GitHub CI, so CI stayed green while the forge-local
+  suite asserted doc-sync's index internals, and it would have stayed green when part 2
+  broke them. `tests/fixtures/doc_sync_indexfree.py` is the live script without its index
+  step. `test_indexfree_doc_sync.py` loads it through `load_doc_sync()` under a throwaway
+  `$HOME`, unskipped, with only the network stubbed. A forge-local drift guard fails if the
+  fixture stops mirroring the live script's API less the index step.
+- `test_doc_sync_cli.py` no longer requires `run_memsearch_index` or an `index` kwarg. The
+  server never passes one.
+- `test_index_failure_reporting.py` now tests the server-level contract with fakes: an
+  `index_error` is surfaced and clears `ok`, and a result with no index keys is `ok`. It
+  used to drive the live doc-sync's memsearch subprocess and CLI exit code, which is
+  doc-sync's own behaviour. That behaviour is removed in part 2.
+
 ## [0.2.1] — 2026-08-30
 
 Telemetry that fails is now visible. Ports the InfluxDB half of the fixes proven in

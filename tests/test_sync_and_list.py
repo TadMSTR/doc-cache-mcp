@@ -27,8 +27,10 @@ class FakeDocSync:
             ]
         }
 
-    def sync_service(self, service, *, force=False, dry_run=False, index=True):
-        self.calls.append((service, dry_run, index))
+    # The shape doc-sync.py returns once its memsearch index step is gone (no `indexed` /
+    # `index_error`). The index-reporting shape is IndexFailsDocSync, below.
+    def sync_service(self, service, *, force=False, dry_run=False):
+        self.calls.append((service, dry_run))
         if service not in self.load_config()["services"]:
             raise ValueError(f"Unknown service: {service}")
         if dry_run:
@@ -37,8 +39,6 @@ class FakeDocSync:
                 "entries_synced": 0,
                 "chunks": 0,
                 "errors": 0,
-                "indexed": None,
-                "index_error": None,
                 "ok": True,
                 "dry_run": True,
                 "results": [],
@@ -48,8 +48,6 @@ class FakeDocSync:
             "entries_synced": 1,
             "chunks": 3,
             "errors": 0,
-            "indexed": {"indexed": True, "returncode": 0, "timed_out": False, "error": None},
-            "index_error": None,
             "ok": True,
             "dry_run": False,
             "results": [{"topic": "overview", "url": "https://x/README.md", "chunks": 3}],
@@ -59,8 +57,8 @@ class FakeDocSync:
 class IndexFailsDocSync(FakeDocSync):
     """The shape actually reported in vikunja#372: docs written, index exited 1."""
 
-    def sync_service(self, service, *, force=False, dry_run=False, index=True):
-        r = super().sync_service(service, force=force, dry_run=dry_run, index=index)
+    def sync_service(self, service, *, force=False, dry_run=False):
+        r = super().sync_service(service, force=force, dry_run=dry_run)
         r["indexed"] = {
             "indexed": False,
             "returncode": 1,
@@ -84,15 +82,14 @@ async def test_sync_ok(fake_ds):
     r = await server.doc_cache_sync("svc")
     assert r["entries_synced"] == 1
     assert r["chunks"] == 3
-    assert r["indexed"]["indexed"] is True
     assert "duration_s" in r
-    assert fake_ds.calls == [("svc", False, True)]
+    assert fake_ds.calls == [("svc", False)]
 
 
 async def test_sync_ok_is_true_on_a_clean_run(fake_ds):
     r = await server.doc_cache_sync("svc")
     assert r["ok"] is True
-    assert r["index_error"] is None
+    assert "index_error" not in r
 
 
 async def test_sync_surfaces_index_failure_at_top_level(monkeypatch):
@@ -113,10 +110,10 @@ async def test_sync_surfaces_index_failure_at_top_level(monkeypatch):
     assert r["chunks"] == 3
 
 
-async def test_sync_dry_run_does_not_index(fake_ds):
+async def test_sync_dry_run_passes_dry_run_through(fake_ds):
     r = await server.doc_cache_sync("svc", dry_run=True)
     assert r["dry_run"] is True
-    assert fake_ds.calls == [("svc", True, True)]
+    assert fake_ds.calls == [("svc", True)]
 
 
 async def test_sync_unknown_service(fake_ds):
@@ -146,11 +143,11 @@ async def test_sync_reports_progress_while_running(fake_ds, monkeypatch):
 
     original_sync_service = fake_ds.sync_service
 
-    def slow_sync_service(service, *, force=False, dry_run=False, index=True):
+    def slow_sync_service(service, *, force=False, dry_run=False):
         import time as _time
 
         _time.sleep(0.05)
-        return original_sync_service(service, force=force, dry_run=dry_run, index=index)
+        return original_sync_service(service, force=force, dry_run=dry_run)
 
     monkeypatch.setattr(fake_ds, "sync_service", slow_sync_service)
 
