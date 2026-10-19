@@ -541,11 +541,13 @@ def load_config() -> dict:
 
 # ── Sync core ─────────────────────────────────────────────────────────────────
 
-#: At most this many topics may lose their TRUSTED chunks to expiry in one run. Expiry from
-#: the trusted tier means a host was demoted; a run that demotes more than a handful is far
-#: likelier a bad allowlist edit than intent, and deleting there would empty the docs cache
-#: (audit R2-01). Past the limit the chunks are left in place and the topic is `failing`,
-#: so the run fails and healthchecks alerts.
+#: At most this many topics may lose their TRUSTED chunks to expiry per sync call — one cron
+#: run, or one `sync_service` call from doc-cache-mcp. Expiry from the trusted tier means a
+#: host was demoted; a call that demotes more than a handful is far likelier a bad allowlist
+#: edit than intent (audit R2-01). Past the limit the chunks are left in place and the topic
+#: is `failing`: the cron run fails and healthchecks alerts. It is a brake, not a total
+#: bound: repeated MCP syncs of one service each get a fresh budget (audit R3-01), so the
+#: first line of defence is load_allowlist refusing a file that trusts nothing.
 TRUSTED_EXPIRY_LIMIT = 5
 _trusted_expiries = 0
 
@@ -738,8 +740,10 @@ def sync_service(service: str, *, force: bool = False, dry_run: bool = False) ->
             ],
         }
 
-    _reset_run_counters()
     with state_lock():
+        # Inside the lock: reset outside it let a second caller zero the budget while the
+        # first was mid-loop (audit R3-01).
+        _reset_run_counters()
         state = load_state()
         summary = _sync_service_entries(service, entries, state)
         save_state(state)
@@ -834,9 +838,9 @@ def main():
     total_synced = 0
     total_errors = 0
     total_expired = 0
-    _reset_run_counters()
 
     with state_lock():
+        _reset_run_counters()  # one budget per cron run, taken under the lock (R3-01)
         state = load_state()
         for service, entries in services.items():
             summary = _sync_service_entries(service, entries, state)

@@ -651,6 +651,12 @@ def doc_cache_remove_topic(service: str, topics: list[str], remove_service: bool
                 return _refused(f"unknown service {service!r}")
             return _refused(f"topic(s) not in {service!r}: {unknown}")
         names_present = [t for t in names if t in present]
+        # The cap covers orphan cleanup too: it deletes chunks just the same (audit R3-02).
+        if len(orphans) + len(names_present) > settings.max_remove_per_call:
+            return _refused(
+                f"would remove {len(orphans) + len(names_present)} topics; "
+                f"max_remove_per_call is {settings.max_remove_per_call}"
+            )
         if orphans and not names_present:
             return {
                 "service": service,

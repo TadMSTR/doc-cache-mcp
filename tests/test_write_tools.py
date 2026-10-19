@@ -483,3 +483,16 @@ def test_an_unknown_service_with_no_state_is_still_refused(ws, monkeypatch):
     monkeypatch.setattr(server, "load_doc_sync", lambda: StatefulFakeDocSync({}))
     r = server.doc_cache_remove_topic("nothere", [], remove_service=True)
     assert r["outcome"] == "refused"
+
+
+def test_orphan_cleanup_is_capped_too(ws, monkeypatch):
+    """R3-02: the orphan path deleted every leftover topic in one call, uncapped."""
+    ds = StatefulFakeDocSync({"goneservice": [{"topic": f"t{i}"} for i in range(30)]})
+    monkeypatch.setattr(server, "load_doc_sync", lambda: ds)
+    r = server.doc_cache_remove_topic("goneservice", [], remove_service=True)
+    assert r["outcome"] == "refused", r
+    assert "max_remove_per_call is 20" in r["reason"]
+    assert ds.removed == []
+    r = server.doc_cache_remove_topic("goneservice", [f"t{i}" for i in range(20)])
+    assert r["outcome"] == "unchanged", r
+    assert len(ds.removed[0][1]) == 20
