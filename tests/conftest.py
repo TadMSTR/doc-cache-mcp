@@ -4,6 +4,8 @@ overrides applied per-test always take effect.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 import doc_cache_mcp.config as config
@@ -14,6 +16,10 @@ import doc_cache_mcp.docsync as docsync
 def _reset_state():
     config.reset_settings()
     docsync.reset()
+    # doc-sync.py imports its vendored allowlist as a top-level module. Without this, the
+    # first doc-sync a test loads (live or fixture) decides which copy every later one gets.
+    sys.modules.pop("doc_cache_allowlist", None)
     yield
     config.reset_settings()
     docsync.reset()
+    sys.modules.pop("doc_cache_allowlist", None)

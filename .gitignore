@@ -14,5 +14,6 @@ htmlcov/
 .coverage
 coverage.xml
 *.log
-core.*
+# Core dumps. Not `core.*`: that also matched source files such as core.py (vikunja#581).
+core.[0-9]*
 *.core

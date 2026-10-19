@@ -45,14 +45,17 @@ class FakeSession:
         self.calls = []
         self.kwargs = []
 
-    def get(self, url, timeout=30, allow_redirects=False):
+    def get(self, url, timeout=30, allow_redirects=False, **kw):
         self.calls.append(url)
         self.kwargs.append(allow_redirects)
         return self._responses.pop(0)
 
 
 def _setup(m, responses):
-    m._ALLOWLIST_CACHE = ALLOW
+    # Pin the allowlist itself, not just the cache: _get_allowlist reloads whenever the
+    # file's fingerprint differs from the cached one, so setting _ALLOWLIST_CACHE alone
+    # quietly tested against whatever allowlist file the host happened to have.
+    m._get_allowlist = lambda: ALLOW
     m.SESSION = FakeSession(responses)
     return m
 

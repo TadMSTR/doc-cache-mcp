@@ -3,7 +3,7 @@
 Deliberately narrow: the transport binding, the path to the shared ``doc-sync.py`` logic
 this server imports, the ``doc-sync.yml`` config it edits, and the source-URL allowlist it
 enforces. No credentials live here — the server runs as ``ted`` like the other host MCPs
-and its only write surface is the docs cache config + cache dir.
+and its only write surface is the docs cache config + cache dirs.
 """
 
 from __future__ import annotations
@@ -56,10 +56,6 @@ class Settings(BaseSettings):
     push_remote: str = "origin"
     push_branch: str = "main"
 
-    # Where a guarded-off commit lands instead of the target branch, so it is reviewable
-    # rather than stranded locally.
-    review_branch_prefix: str = "doc-cache-mcp/review"
-
     # Identity for tool commits. Distinct from the host user so tool commits are
     # attributable, and so the foreign-commit guard has something to match on.
     commit_identity_name: str = "doc-cache-mcp"
@@ -71,6 +67,16 @@ class Settings(BaseSettings):
 
     # Max source entries accepted in a single add_service call (abuse ceiling).
     max_entries_per_add: int = 50
+
+    # Max topics removed by a single remove_topic call.
+    max_remove_per_call: int = 20
+
+    # Where chunks from provisional (unvetted-host) sources are written. Deliberately
+    # OUTSIDE ~/.claude/memory: qmd's agent-memory collection and the memory pipeline walk
+    # that whole tree, so a directory there would be served and promoted as agent memory.
+    # doc-sync.py reads the same env var with the same default; load_doc_sync() also hands
+    # it this value, so a setting from .env (which never reaches os.environ) still agrees.
+    provisional_cache_dir: Path = Path.home() / ".claude" / "docs-provisional"
 
 
 _settings: Settings | None = None
