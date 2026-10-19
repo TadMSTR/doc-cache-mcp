@@ -225,8 +225,16 @@ def fetch_classified(url: str, max_redirects: int = 5) -> tuple[str, str]:
 
     ``trust`` is the LOWEST tier of any hop: a provisional URL that redirects to a trusted
     host is still provisional content, because the provisional host chose where it went.
+    The other direction is REFUSED: a trusted URL that redirects to a provisional host would
+    otherwise yield unvetted content that no TTL, ``max_hosts`` count or promotion event
+    ever sees, because all three key on the configured URL (audit F-02). That is also what
+    v1 did with the same redirect.
+
     A provisional fetch is capped at the allowlist's ``provisional.max_bytes``; a trusted
-    one is read exactly as it always was.
+    one is read exactly as it always was. TLS certificate verification is the control that
+    stops a DNS rebind between the recheck and the connection (an internal service would
+    need a valid certificate for the attacker's name), so a session with it disabled is
+    refused for provisional fetches (audit F-04).
 
     Raises ``doc_cache_allowlist.AllowlistError`` (refused), a requests error,
     ``requests.TooManyRedirects``, or ``ValueError`` (provisional body over the cap).
@@ -236,7 +244,16 @@ def fetch_classified(url: str, max_redirects: int = 5) -> tuple[str, str]:
     trust = _allow.TRUSTED
     for _ in range(max_redirects + 1):
         verdict = _allow.classify_url(current, allowlist)
+        if current != url and trust == _allow.TRUSTED and verdict.trust == _allow.PROVISIONAL:
+            raise _allow.AllowlistError(
+                f"a trusted source redirected to an unvetted host ({verdict.host!r}); "
+                "refused — register that URL itself if it should be cached"
+            )
         trust = _allow.lower_trust(trust, verdict.trust)
+        if trust == _allow.PROVISIONAL and getattr(SESSION, "verify", True) is False:
+            raise _allow.AllowlistError(
+                "TLS verification is disabled; provisional fetches rely on it (rebind guard)"
+            )
         if trust == _allow.PROVISIONAL:
             r = SESSION.get(current, timeout=30, allow_redirects=False, stream=True)
         else:
@@ -547,7 +564,10 @@ def sync_entry_detail(service: str, entry: dict) -> dict:
         if tier == _allow.PROVISIONAL and _provisional_expired(
             entry, allowlist["provisional"]["ttl_days"]
         ):
+            # Both tiers: a host Ted DEMOTED from `hosts` lands here too (it has no
+            # `added`), and its chunks are in the trusted, indexed directory (audit F-05).
             gone = _unlink_topic(service, topic, _allow.PROVISIONAL)
+            gone += _unlink_topic(service, topic, _allow.TRUSTED)
             REMOVED_PATHS.update(gone)
             log.warning(
                 f"[{service}] {topic} — provisional source past its TTL and not promoted; "

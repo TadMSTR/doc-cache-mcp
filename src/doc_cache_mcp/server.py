@@ -300,7 +300,11 @@ def _topic_status(st: dict | None, today: date) -> str:
     return "stale" if age > _STALE_DAYS else "ok"
 
 
-def _trust_label(url: str, allowlist: dict | None) -> str:
+def _trust_label(url: str, allowlist: dict | None, recorded: str | None = None) -> str:
+    """The tier the chunks were written under, if doc-sync recorded one; else the tier the
+    configured URL's host would get. ``recorded`` wins because it is what is on disk."""
+    if recorded in ("trusted", "provisional"):
+        return recorded
     if allowlist is None:
         return "unknown"
     return host_tier(_host(url), allowlist) or "refused"
@@ -376,7 +380,7 @@ def doc_cache_list_services(service: str | None = None, detail: bool = False) ->
                     "last_success": st.get("synced"),
                     "last_error": st.get("last_error"),
                     "consecutive_failures": int(st.get("consecutive_failures", 0) or 0),
-                    "trust": _trust_label(e["url"], allowlist),
+                    "trust": _trust_label(e["url"], allowlist, st.get("trust")),
                 }
             )
         worst = min((r["status"] for r in rows), key=_STATUS_ORDER.index, default="ok")
@@ -605,7 +609,9 @@ def doc_cache_remove_topic(service: str, topics: list[str], remove_service: bool
 
     The config change is made first (``outcome`` as for ``doc_cache_add_service``). Only if
     it lands are the chunks deleted from both cache tiers, the state entries dropped and the
-    metadata index pruned; ``cache`` reports that half.
+    metadata index pruned; ``cache`` reports that half. If ``cache.ok`` is false, call this
+    again with the same topics: a topic already gone from the config but still in sync state
+    is cleaned up (``outcome: unchanged``, listed under ``orphans``).
 
     Args:
         service: Existing service key.
@@ -624,16 +630,36 @@ def doc_cache_remove_topic(service: str, topics: list[str], remove_service: bool
     if not names and not remove_service:
         return _refused("topics is empty; pass remove_service=true to remove the whole service")
 
+    # A topic already gone from the config but still in sync state is the leftover of a
+    # removal whose cache half failed (lock timeout, OSError). Naming it again cleans it up;
+    # before, the retry was refused and nothing else ever deleted those chunks (audit F-06).
+    leftovers = _state_topics(service)
+
     def mutate(config: dict) -> dict:
         services = config["services"]
-        if service not in services:
-            return _refused(f"unknown service {service!r}")
         block = list(services.get(service) or [])
         present = [e.get("topic") for e in block]
         missing = [t for t in names if t not in present]
-        if missing:
-            return _refused(f"topic(s) not in {service!r}: {missing}")
-        doomed = present if (remove_service and not names) else names
+        orphans = [t for t in missing if t in leftovers]
+        unknown = [t for t in missing if t not in leftovers]
+        if unknown:
+            if service not in services:
+                return _refused(f"unknown service {service!r}")
+            return _refused(f"topic(s) not in {service!r}: {unknown}")
+        names_present = [t for t in names if t in present]
+        if orphans and not names_present:
+            return {
+                "service": service,
+                "removed": [],
+                "orphans": orphans,
+                "outcome": UNCHANGED,
+                "sha": None,
+                "change": None,
+                "reason": "config already lacks these topics; cleaning up their cache only",
+            }
+        if service not in services:
+            return _refused(f"unknown service {service!r}")
+        doomed = present if (remove_service and not names) else names_present
         if remove_service and set(doomed) != set(present):
             return _refused(
                 f"remove_service=true removes every topic; list none, or all {len(present)} of them"
@@ -653,13 +679,17 @@ def doc_cache_remove_topic(service: str, topics: list[str], remove_service: bool
             services[service] = remaining
         else:
             del services[service]
-        return {"service": service, "removed": doomed, "service_removed": not remaining}
+        out = {"service": service, "removed": doomed, "service_removed": not remaining}
+        if orphans:
+            out["orphans"] = orphans
+        return out
 
     result = _write_config(
         mutate, service=service, message=f"doc-cache: remove from {service}", expected="remove"
     )
-    if _landed(result):
-        result["cache"] = _remove_cached(service, result["removed"])
+    to_clean = (result.get("removed") or []) + (result.get("orphans") or [])
+    if to_clean and (_landed(result) or result.get("outcome") == UNCHANGED):
+        result["cache"] = _remove_cached(service, to_clean)
     log.info(
         "doc_cache_remove_topic",
         service=service,
@@ -672,6 +702,16 @@ def doc_cache_remove_topic(service: str, topics: list[str], remove_service: bool
         {"removed": len(result.get("removed") or [])},
     )
     return result
+
+
+def _state_topics(service: str) -> set[str]:
+    """Topics doc-sync has state for in ``service``. Empty if state cannot be read."""
+    try:
+        state = load_doc_sync().load_state()
+    except (FileNotFoundError, ImportError, OSError, ValueError, AttributeError) as e:
+        log.error("state_read_failed", error=str(e))
+        return set()
+    return {e.get("topic") for e in state.get(service, []) if isinstance(e, dict)}
 
 
 def _remove_cached(service: str, topics: list[str]) -> dict:

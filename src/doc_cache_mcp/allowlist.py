@@ -124,11 +124,13 @@ def _ip_is_private(ip: ipaddress._BaseAddress) -> bool:
     """True for any address that must never be reached from a cache-fetch (SSRF guard).
 
     ``not is_global`` catches the special-purpose ranges the named flags miss, such as
-    100.64.0.0/10 (CGNAT) and fec0::/10 (pre-audit baseline, SSRF-01).
+    100.64.0.0/10 (CGNAT). It does NOT catch fec0::/10: deprecated site-local addresses are
+    ``is_global`` on Python 3.13, so they are named explicitly (audit F-08).
     """
     ip = _unwrap(ip)
     return (
         not ip.is_global
+        or (ip.version == 6 and ip.is_site_local)
         or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
@@ -329,9 +331,11 @@ def _assert_resolves_public(host: str, resolver: Resolver) -> None:
         except ValueError:
             continue
         if _ip_is_private(ip):
+            # Not the address itself: with the provisional tier any name reaches this check,
+            # and echoing what it resolved to would make the tool an internal DNS oracle
+            # (audit F-11).
             raise AllowlistError(
-                f"allowlisted host {host!r} resolves to non-public address {addr} "
-                "(SSRF / DNS-rebind guard)"
+                f"host {host!r} resolves to a non-public address (SSRF / DNS-rebind guard)"
             )
 
 
@@ -382,6 +386,11 @@ def _structural(url: str) -> tuple:
         raise AllowlistError(f"source url has an invalid port: {url!r}") from exc
     if port not in (None, 443):
         raise AllowlistError(f"source url must use port 443 (got {port}): {url!r}")
+    # urlparse splits ;params off the LAST segment only, so a mid-path `;` stayed in the
+    # path and broke boundary-anchored rules: /-/wikis;x/home and /wiki;/o/r passed the
+    # floor (audit F-12). No docs URL needs a matrix parameter.
+    if ";" in parsed.path or parsed.params:
+        raise AllowlistError(f"source url path must not contain ';': {url!r}")
     return parsed, host
 
 

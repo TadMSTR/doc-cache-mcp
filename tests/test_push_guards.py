@@ -439,7 +439,9 @@ def test_git_env_withholds_the_ssh_agent_socket():
 
     env = _git_env(Path("/tmp/key"))
     assert "SSH_AUTH_SOCK" not in env
-    assert env["GIT_SSH_COMMAND"].startswith("ssh -i /tmp/key")
+    # Audit F-03: without -F /dev/null, IdentitiesOnly still offered ~/.ssh/config's
+    # IdentityFile (the host user's account key) after the deploy key.
+    assert env["GIT_SSH_COMMAND"].startswith("ssh -F /dev/null -i /tmp/key")
     assert "IdentitiesOnly=yes" in env["GIT_SSH_COMMAND"]
     leaky = [
         k for k in env if k != "GIT_SSH_COMMAND" and ("TOKEN" in k.upper() or "KEY" in k.upper())
@@ -508,3 +510,108 @@ def test_every_decision_is_audited(repo, bare, tmp_path):
     events = [json.loads(x) for x in next(audit.glob("*.jsonl")).read_text().splitlines()]
     assert [e["metadata"]["outcome"] for e in events] == ["pushed", "rolled_back"]
     assert all(e["metadata"]["change"] == "additive" for e in events)
+
+
+# --- audit round 1 remediation ---------------------------------------------------------
+
+
+def _config_host_with_identity() -> str | None:
+    cfg = Path.home() / ".ssh" / "config"
+    if not cfg.exists():
+        return None
+    host = None
+    for line in cfg.read_text().splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "host" and "*" not in parts[1]:
+            host = parts[1].split()[0]
+        elif len(parts) == 2 and parts[0].lower() == "identityfile" and host:
+            return host
+    return None
+
+
+def test_ssh_offers_only_the_deploy_key(tmp_path):
+    """F-03, measured with ssh itself against this machine's real ~/.ssh/config.
+
+    ssh finds its user config through the passwd entry, not $HOME, so this cannot be made
+    hermetic. It skips where no Host block names an IdentityFile, and first checks that the
+    pre-fix command DOES pick that key up, so a pass is not vacuous.
+    """
+    import shutil
+
+    host = _config_host_with_identity()
+    if shutil.which("ssh") is None or host is None:
+        pytest.skip("no ssh, or no ~/.ssh/config Host block with an IdentityFile")
+    key = tmp_path / "deploy"
+    key.write_text("k")  # ssh -G drops an -i file that does not exist
+    from doc_cache_mcp.push import _ssh_command
+
+    def idents(cmd: str) -> list[str]:
+        out = subprocess.run(
+            [*cmd.split(), "-G", host], capture_output=True, text=True, timeout=10
+        ).stdout
+        return [x.split(" ", 1)[1] for x in out.splitlines() if x.startswith("identityfile ")]
+
+    fixed = _ssh_command(key)
+    assert len(idents(fixed.replace("-F /dev/null ", ""))) > 1, "pre-fix command not leaky here"
+    assert idents(fixed) == [str(key)]
+
+
+def test_rejected_push_that_actually_landed_is_reported_pushed(repo, monkeypatch):
+    """F-07: a non-zero exit after the remote moved used to be rolled back locally."""
+    real_git = push_mod._git
+
+    def lying_git(repo_path, args, deploy_key=None):
+        if args and args[0] == "push":
+            real_git(repo_path, args, deploy_key)
+            return subprocess.CompletedProcess(args, 1, "", "connection reset")
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", lying_git)
+    out = _change(_target(repo), _add_text())
+    assert out["outcome"] == "pushed", out
+    assert _level(repo)
+
+
+def test_rollback_leaves_a_staged_only_edit_alone(repo, bare, monkeypatch):
+    """F-10: the worktree diff alone missed an edit that was staged, then reverted."""
+    _reject_pushes(bare)
+    real_git = push_mod._git
+    fired = {"n": 0}
+
+    def editing_git(repo_path, args, deploy_key=None):
+        if args and args[0] == "update-ref" and not fired["n"]:
+            fired["n"] = 1
+            f = repo_path / CONFIG_REL
+            keep = f.read_text()
+            f.write_text(keep + "# staged by a human\n")
+            _run(repo_path, "add", CONFIG_REL)
+            f.write_text(keep)  # worktree matches the commit; index does not
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", editing_git)
+    out = _change(_target(repo), _add_text())
+    assert fired["n"]
+    assert out["outcome"] == "stranded", out
+    assert "edited after this call" in out["reason"]
+    assert "# staged by a human" in _run(repo, "show", f":{CONFIG_REL}")
+
+
+def test_git_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    """F-07: subprocess.run(timeout=) killed git but left its ssh child running."""
+    import time
+
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    pidfile = tmp_path / "child.pid"
+    (fake / "git").write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {pidfile}\nwait\n")
+    (fake / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}:/usr/bin:/bin")
+    monkeypatch.setattr(push_mod, "_GIT_TIMEOUT_S", 1)
+    with pytest.raises(subprocess.TimeoutExpired):
+        push_mod._git(tmp_path, ["push"])
+    child = int(pidfile.read_text())
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        import os
+
+        os.kill(child, 0)

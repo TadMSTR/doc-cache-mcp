@@ -69,6 +69,29 @@ half, #581 doc-cache half). **Needs host-forge/scripts with the matching `doc-sy
   meaning: it accepts only what `classify_url` calls trusted.
 - Settings `DOC_CACHE_MCP_PROVISIONAL_CACHE_DIR` and `DOC_CACHE_MCP_MAX_REMOVE_PER_CALL`.
 
+### Security (audit round 1 remediation)
+- **`urllib3>=2.8.0`** (F-01, Medium). 2.7.0's streaming API had an infinite loop and an
+  unbounded chunk-size buffer that a hostile provisional server could trigger through the
+  capped read. The deployed venvs still need upgrading before the provisional tier is
+  enabled.
+- **A trusted URL that redirects to an unvetted host is refused** (F-02). It used to be
+  cached as provisional with no TTL, no `max_hosts` count and no promotion event. The
+  listing's `trust` now reads the tier doc-sync recorded.
+- **ssh runs with `-F /dev/null`** (F-03). `IdentitiesOnly=yes` alone still offered the
+  `IdentityFile` from `~/.ssh/config`: on forge, the host user's account key.
+- **A provisional fetch is refused if TLS verification is off** (F-04). Certificate
+  verification is what stops a DNS rebind between the recheck and the connection;
+  SECURITY.md now says so instead of calling the TOCTOU closed.
+- **Demoting a host deletes its trusted chunks too** (F-05).
+- **`remove_topic` can retry a failed cache cleanup** (F-06): a topic gone from the config
+  but still in sync state is cleaned up, `outcome: unchanged`, under `orphans`.
+- **A rejected push is checked against the remote before rolling back** (F-07), and git
+  runs in its own process group so a timeout also kills its ssh child.
+- **`fec0::/10` is refused** (F-08); the previous comment claimed it already was.
+- The rollback's file-restore check also compares the index (F-10). Refusals no longer echo
+  the private address a name resolved to (F-11). A `;` anywhere in the path is refused;
+  mid-path it got past two boundary-anchored floor rules (F-12).
+
 ### Tests
 - The new tests were run against 0.2.2 first: 38 of the 39 server-level ones fail there.
   `test_push_guards.py` uses real git with a pre-receive hook to reject pushes, and a real

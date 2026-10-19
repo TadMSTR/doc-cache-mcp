@@ -67,16 +67,31 @@ That is **new egress**, and the content is unvetted. Controls:
 - **Size:** a provisional fetch is streamed and refused past `provisional.max_bytes`
   (default 2 MiB), by declared `Content-Length` and by bytes actually read.
 - **Blast radius:** `max_hosts` (default 25) caps distinct provisional hosts at add time;
-  `ttl_days` (default 30) stops syncing an unpromoted topic and deletes its chunks.
+  `ttl_days` (default 30) stops syncing an unpromoted topic and deletes its chunks. Both
+  hold because a topic's tier is its configured URL's: a trusted URL that redirects to an
+  unvetted host is refused rather than cached as provisional (audit F-02). The TTL bounds
+  idle content, not an agent's intent: a re-add starts a fresh TTL, and emits the event
+  again, so Ted's review of the promotion queue is the real bound (audit F-09).
+- **Demotion:** removing a host from `hosts` expires its topics and deletes their chunks
+  from both tiers, including the trusted, qmd-indexed directory (audit F-05).
+- **Dependencies:** `urllib3>=2.8.0`. 2.7.0 had a streaming-API infinite loop and an
+  unbounded chunk-size buffer that a hostile provisional server could trigger through the
+  capped read (audit F-01). The doc-sync venv has no requirements file; its upgrade is a
+  deploy step, and the provisional tier must not be enabled before it.
 - **Labelling and isolation:** chunks go to `~/.claude/docs-provisional/` (outside
   `~/.claude/memory`, so qmd's agent-memory collection and the memory pipeline never see
   them) with `trust: provisional` frontmatter.
 - **No trust escalation:** a redirect from a provisional URL to a trusted host stays
-  provisional. Trust is recomputed from the allowlist on every add and fetch; the
+  provisional, and a trusted URL may not redirect to an unvetted host. Trust is recomputed from the allowlist on every add and fetch; the
   `trust:` field in `doc-sync.yml` is informational and grants nothing.
 - **Never self-service:** `provisional_exclude` (paste sites, shorteners, user-content and
   free-hosting platforms) is refused; only an explicit `hosts` entry admits such a host.
 - **Visibility:** every provisional add emits `doc-cache.provisional.added` to the audit sink.
+- **DNS rebind:** the recheck and the connection are two lookups, so for a provisional
+  host, whose DNS an attacker may run, the recheck only narrows the window. **TLS hostname
+  verification is the control that closes it**: an internal `:443` service would need a
+  valid certificate for the attacker's name. Only `https` on 443 is ever fetched, and a
+  provisional fetch is refused if the session's verification is disabled (audit F-04).
 
 ## Fetch-time enforcement (post-audit, F-01)
 
@@ -90,8 +105,8 @@ enforced at **both** boundaries:
 - **Fetch time** — `doc-sync.py` `fetch_classified` re-classifies the URL **and every redirect hop**
   immediately before each request (`allow_redirects=False`, manual per-hop re-validation).
   This runs the DNS resolve-and-recheck in the same process as the fetch, so the add-time /
-  fetch-time TOCTOU is closed and an allowlisted host cannot 301/302 the fetcher to an
-  internal address. The `doc-sync-daily` cron shares this path, so it too is covered — and
+  fetch-time TOCTOU is narrowed to the resolver/connect gap (TLS verification closes that;
+  see above) and an allowlisted host cannot 301/302 the fetcher to an internal address. The `doc-sync-daily` cron shares this path, so it too is covered — and
   now depends on `doc-cache-allowlist.yml` being present.
 
 ## Residual notes

@@ -410,3 +410,59 @@ def test_trailing_newline_in_a_topic_is_refused(ws):
     r = server.doc_cache_update_topic("existing", "overview\n", "https://docs.example.com/x")
     assert r["outcome"] == "refused"
     assert "invalid topic" in r["reason"]
+
+
+class StatefulFakeDocSync(FakeDocSync):
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+    def load_state(self):
+        return self.state
+
+
+def test_a_failed_cache_cleanup_can_be_retried(ws, monkeypatch):
+    """F-06: the config entry is gone, the chunks are not; naming it again cleans up."""
+    ds = StatefulFakeDocSync({"existing": [{"topic": "gone", "url": "u"}]})
+    monkeypatch.setattr(server, "load_doc_sync", lambda: ds)
+    before = ws.read_text()
+    r = server.doc_cache_remove_topic("existing", ["gone"])
+    assert r["outcome"] == "unchanged", r
+    assert r["orphans"] == ["gone"]
+    assert ds.removed == [("existing", ["gone"])]
+    assert ws.read_text() == before
+
+
+def test_an_unknown_topic_with_no_state_is_still_refused(ws, monkeypatch):
+    ds = StatefulFakeDocSync({})
+    monkeypatch.setattr(server, "load_doc_sync", lambda: ds)
+    r = server.doc_cache_remove_topic("existing", ["ghost"])
+    assert r["outcome"] == "refused"
+    assert ds.removed == []
+
+
+def test_cleanup_of_an_orphan_alongside_a_real_removal(ws, monkeypatch):
+    ds = StatefulFakeDocSync({"existing": [{"topic": "gone", "url": "u"}]})
+    monkeypatch.setattr(server, "load_doc_sync", lambda: ds)
+    r = server.doc_cache_remove_topic("existing", ["install", "gone"])
+    assert r["outcome"] == "written", r
+    assert ds.removed == [("existing", ["install", "gone"])]
+
+
+def test_listing_shows_the_tier_the_chunks_were_written_under(ws, monkeypatch):
+    """F-02 follow-up: the label used to come from the configured host alone."""
+
+    class DS:
+        def load_config(self):
+            return {"services": {"s": [{"topic": "t", "url": "https://docs.example.com/x"}]}}
+
+        def load_state(self):
+            return {
+                "s": [
+                    {"topic": "t", "url": "u", "chunks": 1, "synced": "x", "trust": "provisional"}
+                ]
+            }
+
+    monkeypatch.setattr(server, "load_doc_sync", lambda: DS())
+    row = server.doc_cache_list_services(service="s")["services"][0]["topics"][0]
+    assert row["trust"] == "provisional"

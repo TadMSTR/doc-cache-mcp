@@ -310,3 +310,49 @@ def test_non_global_addresses_are_refused(v2, ip):
     """F-3: CGNAT and other special-purpose ranges are not `is_private`, but not public."""
     with pytest.raises(AllowlistError, match="non-public"):
         classify_url("https://unvetted.example/docs", v2, _resolver(ip))
+
+
+# --- audit round 1 remediation ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ip",
+    [
+        "fec0::1",  # F-08: is_global on 3.13, so it needs naming
+        "100.64.0.1",
+        "192.0.0.8",
+        "198.18.0.1",
+        "64:ff9b:1::1",
+        "::ffff:127.0.0.1",
+        "::",
+        "0.0.0.0",
+        "fe80::1",
+        "fc00::1",
+    ],
+)
+def test_every_probed_non_public_range_is_refused(v2, ip):
+    with pytest.raises(AllowlistError, match="non-public"):
+        classify_url("https://unvetted.example/docs", v2, _resolver(ip))
+
+
+def test_refusal_does_not_echo_the_resolved_address(v2):
+    """F-11: with the provisional tier any name gets here; no internal DNS oracle."""
+    with pytest.raises(AllowlistError) as e:
+        classify_url("https://unvetted.example/docs", v2, _resolver("192.168.1.12"))
+    assert "192.168" not in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://gitlab.com/g/p/-/wikis;x/home",
+        "https://raw.githubusercontent.com/wiki;/o/r/Home.md",
+        "https://docs.docker.com/a;b/c",
+        "https://docs.docker.com/a/b;c",
+    ],
+)
+def test_semicolons_in_the_path_are_refused(v2, url):
+    """F-12: urlparse only splits ;params off the last segment, so a mid-path ; slipped
+    past boundary-anchored floor rules."""
+    with pytest.raises(AllowlistError, match="';'"):
+        classify_url(url, v2, PUBLIC)

@@ -96,14 +96,21 @@ web search — untrusted input. So the allowlist's job is **content trust**, not
   removed, without failing the run), `max_hosts` (default 25 distinct hosts; adds past it
   are refused), and `max_bytes` per fetch (default 2 MiB; larger bodies are refused, not
   truncated).
-- **A redirect never raises trust.** A provisional URL that redirects to a trusted host is
-  still provisional content; a trusted URL that redirects elsewhere is classified as that
-  host.
+- **A redirect never changes a topic's tier.** A provisional URL that redirects to a
+  trusted host is still provisional content. A trusted URL that redirects to an unvetted
+  host is **refused**, as v1 did: it would otherwise be unvetted content that the TTL,
+  `max_hosts` and the promotion event never see, because all three key on the configured
+  URL. Register the target URL itself if it should be cached.
 - **Promotion is one line** in `hosts`. The `trust:` / `added:` fields written into
   `doc-sync.yml` are informational: trust is recomputed from the allowlist on every add
   and every fetch, and the next sync moves the chunks to the trusted directory.
 - Every provisional add emits a `doc-cache.provisional.added` event (host, service, topics)
   to `AUDIT_LOG_DIR` — the promotion queue.
+- **The TTL bounds idle content, not intent.** Removing and re-adding a topic, or adding it
+  under a new name, starts a fresh TTL. Each re-add emits the event, so the promotion queue
+  is the real bound.
+- **Demoting** a host (removing it from `hosts`) expires its topics and deletes their
+  chunks from both directories on the next sync.
 
 ### Allowlist schema (v2)
 
@@ -183,8 +190,10 @@ server, and every step is fail-closed — a check that cannot be *evaluated* is 
 4. **Guards:** every commit in `<remote>/<branch>..HEAD` is the tool's (nobody else's
    unpushed work rides along), and the range touches the config file and nothing else.
 5. **Push the SHA the guards inspected**, never the `HEAD` ref, using `DEPLOY_KEY_PATH`
-   with `IdentitiesOnly=yes` and no ssh agent, so the host user's ambient key cannot be
-   used. Use a key scoped to the single target repo.
+   with `-F /dev/null`, `IdentitiesOnly=yes` and no ssh agent. `IdentitiesOnly` alone still
+   offers `IdentityFile`s from `~/.ssh/config`; not reading the config at all is what makes
+   the deploy key the only identity, so the push URL must carry the user and port. Use a
+   key scoped to the single target repo.
 6. **If the push fails, roll back this call's commit** — a compare-and-swap of the branch
    from exactly this commit to exactly its parent, then a restore of the file if nobody
    edited it since. A concurrent commit makes the swap fail and nothing is reset: the

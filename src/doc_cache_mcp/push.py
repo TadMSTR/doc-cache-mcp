@@ -50,16 +50,19 @@ blocker for the same reason: non-additive changes now come only from the explici
 remove tools, so they are intended, and step 3 holds each tool to its own kind.
 
 **Credentials.** Pushes use a dedicated deploy key, write-scoped to the one repo, with
-``IdentitiesOnly=yes`` and no ``SSH_AUTH_SOCK``, so the host user's ambient key cannot be
-used even by mistake. No forge API token: a review flow that needed one would hand this
-service account-wide reach to save the operator a click.
+``-F /dev/null``, ``IdentitiesOnly=yes`` and no ``SSH_AUTH_SOCK``, so no other key — not
+the agent's, and not one named in ``~/.ssh/config`` — can be used even by mistake. No
+forge API token: a review flow that needed one would hand this service account-wide reach
+to save the operator a click.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
+import signal
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -163,16 +166,20 @@ def classify_change(before: dict | None, after: dict | None) -> str:
 def _ssh_command(deploy_key: Path) -> str:
     """ssh invocation pinned to the deploy key.
 
-    ``IdentitiesOnly=yes`` is the load-bearing option: without it ssh offers every key the
-    agent and the default paths provide, so a misconfigured deploy key would silently
-    succeed using the host user's ambient credentials. ``BatchMode=yes`` so a prompt is a
-    fast failure rather than a hung daemon.
+    ``-F /dev/null`` and ``IdentitiesOnly=yes`` together are the load-bearing part.
+    ``IdentitiesOnly`` alone still offers every *configured* identity, and that includes
+    ``IdentityFile`` lines in ``~/.ssh/config``: on forge it offered the host user's
+    passphraseless account key after the deploy key, so revoking the deploy key would not
+    have stopped the tool (audit F-03). With no config file read, the deploy key is the
+    only identity. The push URL therefore has to carry the user and port itself.
+    ``StrictHostKeyChecking=yes`` still reads the default ``~/.ssh/known_hosts``.
+    ``BatchMode=yes`` so a prompt is a fast failure rather than a hung daemon.
     """
     # Quoted because git runs GIT_SSH_COMMAND through a shell. The path is deployment
     # config, never a caller parameter, so this is not an injection fix — it just removes
     # the standing assumption that the configured path contains no whitespace.
     return (
-        f"ssh -i {shlex.quote(str(deploy_key))} -o IdentitiesOnly=yes "
+        f"ssh -F /dev/null -i {shlex.quote(str(deploy_key))} -o IdentitiesOnly=yes "
         "-o BatchMode=yes -o StrictHostKeyChecking=yes"
     )
 
@@ -196,14 +203,28 @@ def _git_env(deploy_key: Path | None) -> dict[str, str]:
 def _git(
     repo: Path, args: list[str], deploy_key: Path | None = None
 ) -> subprocess.CompletedProcess:
-    """Run git with a fixed argv and a minimal environment. Never a shell."""
-    return subprocess.run(
+    """Run git with a fixed argv and a minimal environment. Never a shell.
+
+    In its own process group, killed as a group on timeout: ``subprocess.run(timeout=)``
+    kills ``git`` but not its ``ssh`` child, so a timed-out push could still complete after
+    the caller had decided it had not (audit F-07).
+    """
+    with subprocess.Popen(
         ["git", "-C", str(repo), *args],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=_GIT_TIMEOUT_S,
         env=_git_env(deploy_key),
-    )
+        start_new_session=True,
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=_GIT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def _rev(repo: Path, ref: str) -> str | None:
@@ -442,8 +463,11 @@ def _rollback(t: GitTarget, pre: str, sha: str) -> str | None:
                 f"HEAD moved past {sha[:8]} (a concurrent commit); not rolled back, so "
                 f"{sha[:8]} is an unpushed commit on local {t.branch}"
             )
+        # Worktree AND index: `restore --staged --worktree` would overwrite a staged-only
+        # edit too, which the worktree diff alone does not see (audit F-10).
         edited = _git(t.repo, ["diff", "--quiet", sha, "--", t.rel])
-        if edited.returncode != 0:
+        staged = _git(t.repo, ["diff", "--quiet", "--cached", sha, "--", t.rel])
+        if edited.returncode != 0 or staged.returncode != 0:
             return (
                 f"ref rolled back to {pre[:8]}, but {t.rel} was edited after this call wrote "
                 "it, so the file was left as it is"
@@ -585,7 +609,21 @@ def commit_change(
         )
         ok = pushed.returncode == 0
         if not ok:
+            # A non-zero exit does not prove the ref did not move: the connection can drop
+            # after the remote updated it. Ask, rather than roll back a landed push (F-07).
             log.error("push_failed", stderr=pushed.stderr.strip())
+            landed = _remote_has(t, tip)
+            if landed is None:
+                return done(
+                    {
+                        **base,
+                        "outcome": STRANDED,
+                        "sha": sha,
+                        "reason": "push was rejected and the remote could not be checked; "
+                        f"{sha[:8]} may or may not be on {t.remote}/{t.branch}",
+                    }
+                )
+            ok = landed
     except (subprocess.SubprocessError, OSError) as exc:
         # Notably TimeoutExpired, where the push may have landed. Ask the remote.
         log.error("push_subprocess_error", error=str(exc))
