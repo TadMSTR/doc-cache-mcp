@@ -56,6 +56,7 @@ init_tracing()
 
 mcp = FastMCP("doc-cache-mcp")
 
+# fullmatch, not match: `$` also matches before a trailing newline, so "svc\n" passed.
 _SERVICE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # Topic goes verbatim into YAML frontmatter and slugged filenames — keep it to safe chars
 # so it can never break out of the frontmatter block or the tags list.
@@ -99,13 +100,13 @@ def _refused(reason: str) -> dict:
 
 
 def _validate_service(service: str) -> str | None:
-    if not isinstance(service, str) or not _SERVICE_RE.match(service):
+    if not isinstance(service, str) or not _SERVICE_RE.fullmatch(service):
         return f"invalid service name {service!r}: must match {_SERVICE_RE.pattern}"
     return None
 
 
 def _validate_topic(topic: str) -> str | None:
-    if not isinstance(topic, str) or not _TOPIC_RE.match(topic):
+    if not isinstance(topic, str) or not _TOPIC_RE.fullmatch(topic):
         return f"invalid topic {topic!r}: must match {_TOPIC_RE.pattern}"
     return None
 
@@ -691,7 +692,7 @@ def _remove_cached(service: str, topics: list[str]) -> dict:
         out = remover(service, topics)
     except (OSError, ValueError, TimeoutError) as e:
         log.error("remove_cache_failed", error=str(e))
-        return {"ok": False, "error": f"cache cleanup failed: {e}"}
+        return {"ok": False, "error": f"cache cleanup failed ({type(e).__name__}; see server log)"}
     out["ok"] = out.get("pruned") is not False
     return out
 

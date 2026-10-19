@@ -109,7 +109,7 @@ web search — untrusted input. So the allowlist's job is **content trust**, not
 
 ```yaml
 hosts: [docs.docker.com, .opensearch.org]            # leading dot = domain suffix
-forge_endpoints: [vikunja.helmforge.me/api/v1/docs.json]
+forge_endpoints: [vikunja.example.internal/api/v1/docs.json]
 deny:
   open_edit:                 # added to the built-in floor; cannot remove from it
     docs.example.com: ['^/community/']

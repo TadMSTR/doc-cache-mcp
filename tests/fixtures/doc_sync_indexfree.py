@@ -360,7 +360,7 @@ def _tier_dir(trust: str) -> Path:
 def _check_service_key(service: str) -> None:
     # Belt-and-suspenders: the service key becomes a directory name. The MCP already
     # validates it, but the cron iterates raw config keys, so validate here too (F-07).
-    if not _SERVICE_KEY_RE.match(service):
+    if not _SERVICE_KEY_RE.fullmatch(service):  # `$` alone admits a trailing newline
         raise ValueError(f"unsafe service key {service!r}: refusing to use as a directory name")
 
 

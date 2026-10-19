@@ -30,11 +30,11 @@ hosts:
   - docs.docker.com
   - github.com
 forge_endpoints:
-  - vikunja.helmforge.me/api/v1/docs.json
+  - vikunja.example.internal/api/v1/docs.json
 """
 V2 = """\
 hosts: [docs.docker.com, .opensearch.org, github.com]
-forge_endpoints: [vikunja.helmforge.me/api/v1/docs.json]
+forge_endpoints: [vikunja.example.internal/api/v1/docs.json]
 deny:
   open_edit:
     docs.docker.com: ['^/community/']
@@ -228,7 +228,7 @@ def test_validate_url_keeps_its_trusted_only_meaning(v2):
 
 def test_host_tier_needs_no_dns(v2, v1):
     assert host_tier("docs.opensearch.org", v2) == TRUSTED
-    assert host_tier("vikunja.helmforge.me", v2) == TRUSTED
+    assert host_tier("vikunja.example.internal", v2) == TRUSTED
     assert host_tier("unvetted.example", v2) == PROVISIONAL
     assert host_tier("pastebin.com", v2) is None
     assert host_tier("unvetted.example", v1) is None
@@ -259,3 +259,54 @@ def test_provisional_needs_enabled_true_exactly(tmp_path):
     p = tmp_path / "a.yml"
     p.write_text("hosts: []\nprovisional:\n  enabled: 'yes'\n")
     assert load_allowlist(p)["provisional"]["enabled"] is False
+
+
+# --- pre-audit baseline findings -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://vikunja.example.internal/api/v1/docs.json/%2e%2e/tasks/all",
+        "https://vikunja.example.internal/api/v1/docs.json/%252e%252e/tasks",
+        "https://vikunja.example.internal/api/v1/docs.json/.%2e/tasks",
+    ],
+)
+def test_encoded_dot_segments_cannot_leave_a_forge_endpoint_prefix(v2, url):
+    """F-1: requests decodes %2e before sending, so the prefix is matched decoded."""
+    with pytest.raises(AllowlistError):
+        classify_url(url, v2, PRIVATE)
+
+
+def test_a_forge_endpoint_still_matches_exactly(v2):
+    u = "https://vikunja.example.internal/api/v1/docs.json"
+    assert classify_url(u, v2, PRIVATE).trust == TRUSTED
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://docs.docker.com/a\ntrust: trusted\n---\nx",
+        "https://docs.docker.com/a\rb",
+        "https://docs.docker.com/a\tb",
+        "https://docs.docker.com/a b",
+        "https://docs.docker.com/a\x00b",
+        "https://docs.docker.com/a\x85b",
+    ],
+)
+def test_whitespace_and_control_characters_are_refused(v2, url):
+    """F-2: urlparse drops \\t\\r\\n, so these classified clean and reached the frontmatter."""
+    with pytest.raises(AllowlistError, match="control characters"):
+        classify_url(url, v2, PUBLIC)
+
+
+def test_overlong_url_is_refused_at_classify_time(v2):
+    with pytest.raises(AllowlistError, match="exceeds"):
+        classify_url("https://docs.docker.com/" + "a" * 2100, v2, PUBLIC)
+
+
+@pytest.mark.parametrize("ip", ["100.64.0.1", "100.127.255.254", "192.0.0.8"])
+def test_non_global_addresses_are_refused(v2, ip):
+    """F-3: CGNAT and other special-purpose ranges are not `is_private`, but not public."""
+    with pytest.raises(AllowlistError, match="non-public"):
+        classify_url("https://unvetted.example/docs", v2, _resolver(ip))

@@ -20,7 +20,7 @@ import doc_cache_mcp.server as server
 
 ALLOW_V2 = """\
 hosts: [docs.example.com, raw.githubusercontent.com, github.com]
-forge_endpoints: [vikunja.helmforge.me/api/v1/docs.json]
+forge_endpoints: [vikunja.example.internal/api/v1/docs.json]
 deny:
   path_shapes:
     github.com: ['^/[^/]+/[^/]+/(blob|raw|tree|releases)/']
@@ -396,3 +396,17 @@ def test_push_without_a_deploy_key_is_refused_before_writing(gitws, monkeypatch)
     r = server.doc_cache_add_service("new", [_e("a", "https://docs.example.com/a")])
     assert r["outcome"] == "refused"
     assert gitws["cfg"].read_text() == before
+
+
+@pytest.mark.parametrize("bad", ["svc\n", "svc\r\n"])
+def test_trailing_newline_in_a_service_name_is_refused(ws, bad):
+    """IV-01: `$` matches before a trailing newline, so `.match` accepted these."""
+    r = server.doc_cache_add_service(bad, [_e("a", "https://docs.example.com/a")])
+    assert r["outcome"] == "refused"
+
+
+def test_trailing_newline_in_a_topic_is_refused(ws):
+    """update_topic takes the topic verbatim (add strips it), so it is the reachable path."""
+    r = server.doc_cache_update_topic("existing", "overview\n", "https://docs.example.com/x")
+    assert r["outcome"] == "refused"
+    assert "invalid topic" in r["reason"]

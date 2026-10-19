@@ -121,10 +121,15 @@ def _unwrap(ip: ipaddress._BaseAddress) -> ipaddress._BaseAddress:
 
 
 def _ip_is_private(ip: ipaddress._BaseAddress) -> bool:
-    """True for any address that must never be reached from a cache-fetch (SSRF guard)."""
+    """True for any address that must never be reached from a cache-fetch (SSRF guard).
+
+    ``not is_global`` catches the special-purpose ranges the named flags miss, such as
+    100.64.0.0/10 (CGNAT) and fec0::/10 (pre-audit baseline, SSRF-01).
+    """
     ip = _unwrap(ip)
     return (
-        ip.is_private
+        not ip.is_global
+        or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_reserved
@@ -288,18 +293,22 @@ def _path_matches_prefix(url_path: str, prefix: str) -> bool:
     return norm == ep or norm.startswith(ep + "/")
 
 
-def _normalised_path(path: str) -> str:
-    """The path the server will route on: percent-decoded (repeatedly, so %252F and
-    %2F both land), repeated slashes collapsed, dot segments resolved, lowercased.
-    Matching the raw string let %77iki, wiki%2F, /./wiki and // through (audit R2-01)."""
+def _decoded_path(path: str) -> str:
+    """The path the server will route on: percent-decoded (repeatedly, so %252F and %2F
+    both land), repeated slashes collapsed, dot segments resolved. Case preserved."""
     p = path or "/"
     for _ in range(4):
         q = unquote(p)
         if q == p:
             break
         p = q
-    p = posixpath.normpath("/" + re.sub(r"/+", "/", p).lstrip("/"))
-    return p.lower()
+    return posixpath.normpath("/" + re.sub(r"/+", "/", p).lstrip("/"))
+
+
+def _normalised_path(path: str) -> str:
+    """:func:`_decoded_path`, lowercased — for deny matching, where wider is safer.
+    Matching the raw string let %77iki, wiki%2F, /./wiki and // through (audit R2-01)."""
+    return _decoded_path(path).lower()
 
 
 def _assert_resolves_public(host: str, resolver: Resolver) -> None:
@@ -326,12 +335,27 @@ def _assert_resolves_public(host: str, resolver: Resolver) -> None:
             )
 
 
+#: Longer than any real docs URL. Checked here, not only at add time, because a redirect
+#: ``Location`` reaches this function at fetch time and the deny regexes run on it.
+MAX_URL_LEN = 2048
+
+# Whitespace and C0/C1 controls. urlparse silently drops \t \r \n, so a URL carrying them
+# classified as if they were absent and was then written verbatim into doc-sync.yml and the
+# chunk frontmatter, where a newline forges fields (pre-audit baseline, SH-03).
+_UNSAFE_URL_CHARS = re.compile(r"[\x00-\x20\x7f-\x9f]")
+
+
 def _structural(url: str) -> tuple:
     """Step 1. Returns ``(parsed, host)`` or raises."""
     if not isinstance(url, str) or not url.strip():
         raise AllowlistError("source url must be a non-empty string")
+    url = url.strip()
+    if len(url) > MAX_URL_LEN:
+        raise AllowlistError(f"source url exceeds {MAX_URL_LEN} characters")
+    if _UNSAFE_URL_CHARS.search(url):
+        raise AllowlistError(f"source url contains whitespace or control characters: {url!r}")
 
-    parsed = urlparse(url.strip())
+    parsed = urlparse(url)
     if parsed.scheme != "https":
         raise AllowlistError(f"source url must use https (got scheme {parsed.scheme!r}): {url!r}")
     host = parsed.hostname
@@ -421,9 +445,12 @@ def classify_url(url: str, allowlist: dict, resolver: Resolver | None = None) ->
     _deny(url, host, path, allowlist)
 
     # Explicit forge endpoint: trusted internal source, name + boundary-checked path match.
-    # Allowed to resolve to private forge addresses, so no DNS re-check.
+    # Allowed to resolve to private forge addresses, so no DNS re-check. Matched on the
+    # DECODED path: requests turns %2e back into "." before sending, so a raw-path match let
+    # /docs.json/%2e%2e/tasks through as inside the prefix (pre-audit baseline F-1).
+    decoded = _decoded_path(parsed.path)
     for eh, eprefix in allowlist.get("forge_endpoints", []):
-        if host == eh and _path_matches_prefix(parsed.path, eprefix):
+        if host == eh and _path_matches_prefix(decoded, eprefix):
             return Verdict(TRUSTED, host, url)
 
     if _matches_any(host, allowlist.get("hosts", set())):

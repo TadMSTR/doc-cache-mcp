@@ -241,18 +241,19 @@ def precondition(t: GitTarget) -> str | None:
             return f"cannot read git status of {t.rel}"
         if status.stdout.strip():
             return (
-                f"{t.rel} has uncommitted changes in {t.repo}; they must be committed or "
+                f"{t.rel} has uncommitted changes in the checkout; they must be committed or "
                 "discarded (sysadmin) before this tool can change it"
             )
         if not t.push:
             return None
 
         if t.deploy_key is None or not t.deploy_key.exists():
-            return f"deploy key not found at {t.deploy_key}"
+            log.error("precondition_no_deploy_key", path=str(t.deploy_key))
+            return "deploy key not found (path in the server log)"
         head_ref = _git(t.repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
         if head_ref.returncode != 0 or head_ref.stdout.strip() != t.branch:
             on = head_ref.stdout.strip() or "a detached HEAD"
-            return f"{t.repo} is on {on}, not {t.branch}; sysadmin must check out {t.branch}"
+            return f"the checkout is on {on}, not {t.branch}; sysadmin must check out {t.branch}"
         fetch = _git(t.repo, ["fetch", "--quiet", t.remote, t.branch], deploy_key=t.deploy_key)
         if fetch.returncode != 0:
             log.error("precondition_fetch_failed", stderr=fetch.stderr.strip())
