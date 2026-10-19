@@ -466,3 +466,20 @@ def test_listing_shows_the_tier_the_chunks_were_written_under(ws, monkeypatch):
     monkeypatch.setattr(server, "load_doc_sync", lambda: DS())
     row = server.doc_cache_list_services(service="s")["services"][0]["topics"][0]
     assert row["trust"] == "provisional"
+
+
+def test_a_failed_whole_service_cleanup_can_be_retried_with_an_empty_list(ws, monkeypatch):
+    """R2-03: the docstring says retry with the same arguments; for remove_service=true
+    with no topics that used to be refused as an unknown service."""
+    ds = StatefulFakeDocSync({"goneservice": [{"topic": "a"}, {"topic": "b"}]})
+    monkeypatch.setattr(server, "load_doc_sync", lambda: ds)
+    r = server.doc_cache_remove_topic("goneservice", [], remove_service=True)
+    assert r["outcome"] == "unchanged", r
+    assert r["orphans"] == ["a", "b"]
+    assert ds.removed == [("goneservice", ["a", "b"])]
+
+
+def test_an_unknown_service_with_no_state_is_still_refused(ws, monkeypatch):
+    monkeypatch.setattr(server, "load_doc_sync", lambda: StatefulFakeDocSync({}))
+    r = server.doc_cache_remove_topic("nothere", [], remove_service=True)
+    assert r["outcome"] == "refused"

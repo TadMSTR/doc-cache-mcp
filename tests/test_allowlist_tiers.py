@@ -349,6 +349,11 @@ def test_refusal_does_not_echo_the_resolved_address(v2):
         "https://raw.githubusercontent.com/wiki;/o/r/Home.md",
         "https://docs.docker.com/a;b/c",
         "https://docs.docker.com/a/b;c",
+        # R2-04: the floor rules see the decoded path, so %3B is the same `;` to them.
+        "https://gitlab.com/g/p/-/wikis%3Bx/home",
+        "https://gitlab.com/g/p/-/wikis%3bx/home",
+        "https://raw.githubusercontent.com/wiki%3B/o/r/Home.md",
+        "https://docs.docker.com/a%253Bb",
     ],
 )
 def test_semicolons_in_the_path_are_refused(v2, url):
@@ -356,3 +361,24 @@ def test_semicolons_in_the_path_are_refused(v2, url):
     past boundary-anchored floor rules."""
     with pytest.raises(AllowlistError, match="';'"):
         classify_url(url, v2, PUBLIC)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "provisional:\n  enabled: true\n",
+        "hosts: []\nforge_endpoints: []\nprovisional:\n  enabled: true\n",
+    ],
+)
+def test_enabled_provisional_with_nothing_trusted_is_refused(tmp_path, text):
+    """R2-01: it would classify every configured topic provisional and expire them all."""
+    p = tmp_path / "a.yml"
+    p.write_text(text)
+    with pytest.raises(AllowlistError, match="no hosts and no forge_endpoints"):
+        load_allowlist(p)
+
+
+def test_an_empty_hosts_list_is_still_fine_with_provisional_off(tmp_path):
+    p = tmp_path / "a.yml"
+    p.write_text("hosts: []\n")
+    assert load_allowlist(p)["hosts"] == set()

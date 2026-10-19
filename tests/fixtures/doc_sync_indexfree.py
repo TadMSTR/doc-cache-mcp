@@ -255,6 +255,10 @@ def fetch_classified(url: str, max_redirects: int = 5) -> tuple[str, str]:
                 "TLS verification is disabled; provisional fetches rely on it (rebind guard)"
             )
         if trust == _allow.PROVISIONAL:
+            old = _urllib3_too_old()
+            if old:
+                raise _allow.AllowlistError(f"provisional fetch refused: {old} (audit F-01)")
+        if trust == _allow.PROVISIONAL:
             r = SESSION.get(current, timeout=30, allow_redirects=False, stream=True)
         else:
             r = SESSION.get(current, timeout=30, allow_redirects=False)
@@ -537,6 +541,40 @@ def load_config() -> dict:
 
 # ── Sync core ─────────────────────────────────────────────────────────────────
 
+#: At most this many topics may lose their TRUSTED chunks to expiry in one run. Expiry from
+#: the trusted tier means a host was demoted; a run that demotes more than a handful is far
+#: likelier a bad allowlist edit than intent, and deleting there would empty the docs cache
+#: (audit R2-01). Past the limit the chunks are left in place and the topic is `failing`,
+#: so the run fails and healthchecks alerts.
+TRUSTED_EXPIRY_LIMIT = 5
+_trusted_expiries = 0
+
+#: The streaming read below is only safe on urllib3 >= 2.8.0 (GHSA-gh4c-6fx4-qh6g infinite
+#: loop, GHSA-vxq7-64xx-v4gw unbounded chunk-size line). A provisional host is anyone's
+#: server, so on an older urllib3 provisional fetches are refused rather than trusted to a
+#: deploy step (audit F-01 / R2-02).
+MIN_URLLIB3 = (2, 8, 0)
+
+
+def _reset_run_counters() -> None:
+    global _trusted_expiries
+    _trusted_expiries = 0
+
+
+def _urllib3_too_old() -> str | None:
+    try:
+        import urllib3
+    except ImportError:  # only in hermetic tests that stub requests out entirely
+        return None
+    try:
+        have = tuple(int(x) for x in urllib3.__version__.split(".")[:3])
+    except ValueError:
+        return f"unparseable urllib3 version {urllib3.__version__!r}"
+    if have < MIN_URLLIB3:
+        return f"urllib3 {urllib3.__version__} < {'.'.join(map(str, MIN_URLLIB3))}"
+    return None
+
+
 def _provisional_expired(entry: dict, ttl_days: int) -> bool:
     """True if a provisional entry is past its TTL. A missing or bad `added` is expired:
     unvetted content with no provenance date fails closed, not open-ended."""
@@ -565,9 +603,22 @@ def sync_entry_detail(service: str, entry: dict) -> dict:
             entry, allowlist["provisional"]["ttl_days"]
         ):
             # Both tiers: a host Ted DEMOTED from `hosts` lands here too (it has no
-            # `added`), and its chunks are in the trusted, indexed directory (audit F-05).
+            # `added`), and its chunks are in the trusted, indexed directory (audit F-05) —
+            # but not past TRUSTED_EXPIRY_LIMIT in one run (audit R2-01).
+            global _trusted_expiries
+            trusted_dir = CACHE_DIR / service
+            has_trusted = trusted_dir.is_dir() and bool(_topic_files(trusted_dir, topic))
+            if has_trusted and _trusted_expiries >= TRUSTED_EXPIRY_LIMIT:
+                msg = (
+                    f"more than {TRUSTED_EXPIRY_LIMIT} topics would lose trusted chunks to "
+                    "expiry this run; left in place (check the allowlist's hosts)"
+                )
+                log.error(f"[{service}] {topic} — {msg}")
+                return {"status": "failing", "chunks": -1, "trust": tier, "error": msg}
             gone = _unlink_topic(service, topic, _allow.PROVISIONAL)
-            gone += _unlink_topic(service, topic, _allow.TRUSTED)
+            if has_trusted:
+                _trusted_expiries += 1
+                gone += _unlink_topic(service, topic, _allow.TRUSTED)
             REMOVED_PATHS.update(gone)
             log.warning(
                 f"[{service}] {topic} — provisional source past its TTL and not promoted; "
@@ -687,6 +738,7 @@ def sync_service(service: str, *, force: bool = False, dry_run: bool = False) ->
             ],
         }
 
+    _reset_run_counters()
     with state_lock():
         state = load_state()
         summary = _sync_service_entries(service, entries, state)
@@ -782,6 +834,7 @@ def main():
     total_synced = 0
     total_errors = 0
     total_expired = 0
+    _reset_run_counters()
 
     with state_lock():
         state = load_state()

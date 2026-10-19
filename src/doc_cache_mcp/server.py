@@ -641,6 +641,10 @@ def doc_cache_remove_topic(service: str, topics: list[str], remove_service: bool
         present = [e.get("topic") for e in block]
         missing = [t for t in names if t not in present]
         orphans = [t for t in missing if t in leftovers]
+        if not names and remove_service and service not in services and leftovers:
+            # Retry of a whole-service removal: the service is gone, its state is not
+            # (audit R2-03).
+            orphans = sorted(leftovers)
         unknown = [t for t in missing if t not in leftovers]
         if unknown:
             if service not in services:

@@ -89,8 +89,13 @@ half, #581 doc-cache half). **Needs host-forge/scripts with the matching `doc-sy
   runs in its own process group so a timeout also kills its ssh child.
 - **`fec0::/10` is refused** (F-08); the previous comment claimed it already was.
 - The rollback's file-restore check also compares the index (F-10). Refusals no longer echo
-  the private address a name resolved to (F-11). A `;` anywhere in the path is refused;
-  mid-path it got past two boundary-anchored floor rules (F-12).
+  the private address a name resolved to (F-11). A `;` anywhere in the path is refused,
+  raw or percent-encoded; mid-path it got past two boundary-anchored floor rules (F-12,
+  R2-04).
+- **Round 2:** an allowlist that enables provisional but lists no hosts and no forge
+  endpoints is refused, since every topic would expire (R2-01). A landed push counts as
+  landed if the remote has moved past it (R2-05, `merge-base --is-ancestor`). A whole-service
+  removal can be retried with an empty `topics` list (R2-03).
 
 ### Tests
 - The new tests were run against 0.2.2 first: 38 of the 39 server-level ones fail there.

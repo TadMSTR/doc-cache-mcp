@@ -244,12 +244,23 @@ def load_allowlist(path) -> dict:
     if not isinstance(deny, dict):
         raise AllowlistError("allowlist deny must be a mapping")
 
+    provisional = _load_provisional(data.get("provisional"))
+    # With the tier on, a file that trusts nothing would classify every configured topic
+    # provisional; with no `added` they all expire, and expiry deletes trusted chunks — one
+    # bad edit would empty the docs cache at 03:00 (audit R2-01). Refuse the file instead,
+    # which sends every topic down the non-destructive `failing` path.
+    if provisional["enabled"] and not hosts and not forge_endpoints:
+        raise AllowlistError(
+            "allowlist enables provisional but lists no hosts and no forge_endpoints; "
+            "refusing it rather than treating every source as unvetted"
+        )
+
     return {
         "hosts": hosts,
         "forge_endpoints": forge_endpoints,
         "open_edit": _compile_host_patterns(deny.get("open_edit"), "deny.open_edit"),
         "path_shapes": _compile_host_patterns(deny.get("path_shapes"), "deny.path_shapes"),
-        "provisional": _load_provisional(data.get("provisional")),
+        "provisional": provisional,
         "provisional_exclude": {_norm_host(h) for h in (data.get("provisional_exclude") or [])},
         "source": str(path),
         "loaded_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -389,7 +400,9 @@ def _structural(url: str) -> tuple:
     # urlparse splits ;params off the LAST segment only, so a mid-path `;` stayed in the
     # path and broke boundary-anchored rules: /-/wikis;x/home and /wiki;/o/r passed the
     # floor (audit F-12). No docs URL needs a matrix parameter.
-    if ";" in parsed.path or parsed.params:
+    # Raw AND decoded: the floor rules match the decoded path, so %3B is the same `;` to
+    # them (audit R2-04).
+    if ";" in parsed.path or parsed.params or ";" in _decoded_path(parsed.path):
         raise AllowlistError(f"source url path must not contain ';': {url!r}")
     return parsed, host
 

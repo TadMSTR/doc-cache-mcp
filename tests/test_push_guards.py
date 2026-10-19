@@ -615,3 +615,23 @@ def test_git_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
         import os
 
         os.kill(child, 0)
+
+
+def test_a_landed_push_that_someone_built_on_is_still_pushed(repo, tmp_path, bare, monkeypatch):
+    """R2-05: _remote_has compared for equality, so a commit landing on top in between
+    made a landed push read as not landed — and roll back."""
+    other = tmp_path / "other"
+    real_git = push_mod._git
+
+    def racing_git(repo_path, args, deploy_key=None):
+        if args and args[0] == "push":
+            real_git(repo_path, args, deploy_key)
+            subprocess.run(["git", "clone", "-q", str(bare), str(other)], check=True)
+            _human(other, "README", "on top\n", "someone else, same second")
+            _run(other, "push", "-q", "origin", "main")
+            return subprocess.CompletedProcess(args, 1, "", "connection reset")
+        return real_git(repo_path, args, deploy_key)
+
+    monkeypatch.setattr(push_mod, "_git", racing_git)
+    out = _change(_target(repo), _add_text())
+    assert out["outcome"] == "pushed", out

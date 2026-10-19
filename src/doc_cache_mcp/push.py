@@ -493,7 +493,12 @@ def _remote_has(t: GitTarget, sha: str) -> bool | None:
         fetch = _git(t.repo, ["fetch", "--quiet", t.remote, t.branch], deploy_key=t.deploy_key)
         if fetch.returncode != 0:
             return None
-        return _rev(t.repo, f"{t.remote}/{t.branch}") == sha
+        # Ancestry, not equality: someone else's commit landing on top before this fetch
+        # would otherwise read as "did not land" and roll back a landed push (audit R2-05).
+        r = _git(t.repo, ["merge-base", "--is-ancestor", sha, f"{t.remote}/{t.branch}"])
+        if r.returncode in (0, 1):
+            return r.returncode == 0
+        return None
     except (subprocess.SubprocessError, OSError):
         return None
 
