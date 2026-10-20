@@ -895,7 +895,10 @@ def main() -> None:
     if cfg.transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        mcp.run(transport=cfg.transport, host=cfg.host, port=cfg.port)
+        # Stateless: no tool keeps per-session state, and a stateful server never
+        # reclaimed sessions (CVE-2026-59951, p2 audit F-06). Progress notifications still
+        # ride the request's own stream, so doc_cache_sync's heartbeat is unaffected.
+        mcp.run(transport=cfg.transport, host=cfg.host, port=cfg.port, stateless_http=True)
 
 
 if __name__ == "__main__":

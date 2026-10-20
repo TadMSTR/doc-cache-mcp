@@ -360,6 +360,37 @@ MAX_URL_LEN = 2048
 _UNSAFE_URL_CHARS = re.compile(r"[\x00-\x20\x7f-\x9f]")
 
 
+#: WHATWG "ends in a number": a host whose last label is all digits or 0x-hex is parsed as
+#: an IPv4 address, whatever the labels before it are. No TLD looks like this.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _is_ip_literal(host: str) -> bool:
+    """True for any host the resolver would read as an address rather than a name.
+
+    ``ipaddress`` only knows dotted-quad and IPv6. ``getaddrinfo`` goes through
+    ``inet_aton``, which also takes ``16843009``, ``0x01010101``, octal ``0177.0.0.1`` and
+    short ``1.1`` (audit F-04), so both are asked. ``host`` is already lowercased with any
+    trailing dot stripped.
+
+    The old check raised inside ``try``/``except ValueError``; AllowlistError subclasses
+    ValueError, so the refusal was swallowed and every literal passed (vikunja#1172).
+    """
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return True
+    if _NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
+        return True
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        return False
+    return True
+
+
 def _structural(url: str) -> tuple:
     """Step 1. Returns ``(parsed, host)`` or raises."""
     if not isinstance(url, str) or not url.strip():
@@ -379,12 +410,10 @@ def _structural(url: str) -> tuple:
     host = host.lower().rstrip(".")
 
     # Reject IP-literal hosts outright — the allowlist matches by name only, and a literal
-    # is exactly how an SSRF payload names an internal target.
-    try:
-        ipaddress.ip_address(host.strip("[]"))
+    # is exactly how an SSRF payload names an internal target, or names an excluded host
+    # by its address to step around provisional_exclude.
+    if _is_ip_literal(host):
         raise AllowlistError(f"source url host must be a name, not an IP literal: {host!r}")
-    except ValueError:
-        pass  # not an IP literal — good, it's a hostname
 
     # userinfo is how a URL is made to read as one host while naming another
     # (https://docs.example.com@evil.net/), and a non-default port reaches a different
