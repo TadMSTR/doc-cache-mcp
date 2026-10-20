@@ -182,14 +182,23 @@ async def test_sync_heartbeat_stops_after_completion(fake_ds, monkeypatch):
     assert len(calls) == count_at_return
 
 
-def test_list_services(fake_ds):
-    r = server.doc_cache_list_services()
+def test_list_services_detail(fake_ds):
+    r = server.doc_cache_list_services(detail=True)
     assert r["count"] == 1
     svc = r["services"][0]
     assert svc["service"] == "svc"
     assert svc["topic_count"] == 1
-    assert svc["total_chunks"] == 3
-    assert svc["topics"][0]["last_synced"] == "2026-07-07"
+    assert svc["chunks"] == 3
+    row = svc["topics"][0]
+    assert row["last_success"] == "2026-07-07"
+    assert row["status"] == "stale"  # a 2026-07-07 success is more than 3 days old
+
+
+def test_list_services_summary_has_no_topic_rows(fake_ds):
+    r = server.doc_cache_list_services()
+    assert r["services"] == {"svc": {"topics": 1, "chunks": 3, "status": "stale"}}
+    assert r["health"]["stale"] == 1
+    assert r["failing"] == []
 
 
 def test_list_services_unsynced_topic_shows_zero(monkeypatch):
@@ -198,7 +207,8 @@ def test_list_services_unsynced_topic_shows_zero(monkeypatch):
             return {}  # nothing synced yet
 
     monkeypatch.setattr(server, "load_doc_sync", lambda: DS())
-    r = server.doc_cache_list_services()
+    r = server.doc_cache_list_services(service="svc")
     svc = r["services"][0]
-    assert svc["total_chunks"] == 0
-    assert svc["topics"][0]["last_synced"] is None
+    assert svc["chunks"] == 0
+    assert svc["topics"][0]["last_success"] is None
+    assert svc["topics"][0]["status"] == "never_synced"

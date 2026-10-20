@@ -4,6 +4,108 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] — 2026-10-19
+
+Every doc-cache call now finishes or fails, and says which. Topics can be repointed and
+removed through the tool. A failing topic shows up in the listing. A provisional trust tier
+lets research cache a new vendor's docs without an operator commit, labelled as unvetted.
+This is doc-cache-friction-2026-10 part 1 (vikunja#653; folds #457, #647, #1167, #380 code
+half, #581 doc-cache half). **Needs host-forge/scripts with the matching `doc-sync.py`**
+(failure state, `remove_topics`, provisional tier, regenerated `doc_cache_allowlist.py`).
+
+### Fixed
+- **A single repoint no longer poisons every later push** (#653, #457). v0.2 degraded any
+  guard refusal to a pushed review branch and left the commit on local `main`. Every later
+  call's push range then contained it, so every later call degraded too, reporting
+  `pushed: false` with a `reason` that described the earlier call. Reproduced on 0.2.2: a
+  purely additive add returned "refuses to change the url of existing topic 't'".
+- **A failed sync is recorded instead of freezing `last_synced`** (#647). Needs the
+  matching doc-sync.py: state now carries `last_attempt`, `last_error` and
+  `consecutive_failures`, and `synced` stays the date of the last success. On 2026-10-19
+  the listing showed 0 failing topics while that night's run had 15 errors.
+- **Open-edit wikis are refused at add time**, not only at fetch time (#1167). The rule set
+  moved from doc-sync.py into `allowlist.py`, so both boundaries run the same code.
+- **The audit sink failing is counted**: `doc_cache_audit_sink_errors_total` plus an
+  ERROR log, alongside the existing `audit_error` in the result (#380, code half).
+- `.gitignore` ignores `core.[0-9]*` instead of `core.*`, which also matched source files
+  (#581).
+
+### Changed — breaking
+- **Write tools return `outcome`** — `pushed`, `committed_local`, `written`, `unchanged`,
+  `rolled_back`, `refused` or `stranded` — with `sha`, `change` and `reason` at the top
+  level. The `commit` sub-dict, `pushed`, `pushed_sha`, `review_branch` and `pr_url` are
+  gone. Refusals keep an `error` key alongside `reason`.
+- **The review-branch path is removed.** A call either pushes or rolls back its own commit
+  (compare-and-swap on the ref, never a reset). Before writing, the checkout must be clean
+  for `doc-sync.yml` and level with the remote; otherwise the call is refused and names the
+  condition. `DOC_CACHE_MCP_REVIEW_BRANCH_PREFIX` is removed.
+- **The additive-only rule is no longer a push blocker.** Each tool is held to its own kind
+  of change instead: add only adds, update only repoints, remove only removes. Anything
+  else is rolled back.
+- **`doc_cache_add_service` is strictly additive.** An existing topic with a different URL
+  is refused with a pointer to `doc_cache_update_topic`; the same URL is `unchanged`. A URL
+  already registered under another topic of the service gets a warning.
+- **`doc_cache_list_services` returns a health summary by default**: per service (keyed by
+  name) its topic count, chunk total and worst status, plus `health` and `failing`. It
+  stays under 10 KB at 104 services; the old full listing was 56.6 KB. `service=` or
+  `detail=true` gives per-topic rows with `status`, `last_success`, `last_error`,
+  `consecutive_failures` and `trust`.
+- **URLs with userinfo or a port other than 443 are refused.**
+
+### Added
+- `doc_cache_update_topic(service, topic, url)` and
+  `doc_cache_remove_topic(service, topics, remove_service=False)` (at most 20 per call;
+  removes chunks in both tiers, sync state and metadata-index rows via doc-sync's
+  `remove_topics`).
+- **Provisional trust tier** (D1 = A). With `provisional.enabled` in the allowlist, any
+  public host not on `provisional_exclude` is cached to `~/.claude/docs-provisional/`
+  (outside `~/.claude/memory`) with `trust: provisional` frontmatter, capped by
+  `max_hosts`, `ttl_days` and `max_bytes`. A redirect never raises trust. Promotion is one
+  line in `hosts`. Each provisional add emits `doc-cache.provisional.added`. A v1 allowlist
+  (no `provisional` block) behaves exactly as before.
+- **Allowlist v2:** leading-dot suffix hosts, `deny.open_edit` (adds to the built-in
+  floor), `deny.path_shapes`, `provisional`, `provisional_exclude`.
+- `classify_url`, `host_tier`, `lower_trust` in `allowlist.py`. `validate_url` keeps its
+  meaning: it accepts only what `classify_url` calls trusted.
+- Settings `DOC_CACHE_MCP_PROVISIONAL_CACHE_DIR` and `DOC_CACHE_MCP_MAX_REMOVE_PER_CALL`.
+
+### Security (audit round 1 remediation)
+- **`urllib3>=2.8.0`** (F-01, Medium). 2.7.0's streaming API had an infinite loop and an
+  unbounded chunk-size buffer that a hostile provisional server could trigger through the
+  capped read. The deployed venvs still need upgrading before the provisional tier is
+  enabled.
+- **A trusted URL that redirects to an unvetted host is refused** (F-02). It used to be
+  cached as provisional with no TTL, no `max_hosts` count and no promotion event. The
+  listing's `trust` now reads the tier doc-sync recorded.
+- **ssh runs with `-F /dev/null`** (F-03). `IdentitiesOnly=yes` alone still offered the
+  `IdentityFile` from `~/.ssh/config`: on forge, the host user's account key.
+- **A provisional fetch is refused if TLS verification is off** (F-04). Certificate
+  verification is what stops a DNS rebind between the recheck and the connection;
+  SECURITY.md now says so instead of calling the TOCTOU closed.
+- **Demoting a host deletes its trusted chunks too** (F-05).
+- **`remove_topic` can retry a failed cache cleanup** (F-06): a topic gone from the config
+  but still in sync state is cleaned up, `outcome: unchanged`, under `orphans`.
+- **A rejected push is checked against the remote before rolling back** (F-07), and git
+  runs in its own process group so a timeout also kills its ssh child.
+- **`fec0::/10` is refused** (F-08); the previous comment claimed it already was.
+- The rollback's file-restore check also compares the index (F-10). Refusals no longer echo
+  the private address a name resolved to (F-11). A `;` anywhere in the path is refused,
+  raw or percent-encoded; mid-path it got past two boundary-anchored floor rules (F-12,
+  R2-04).
+- **Round 2:** an allowlist that enables provisional but lists no hosts and no forge
+  endpoints is refused, since every topic would expire (R2-01). A landed push counts as
+  landed if the remote has moved past it (R2-05, `merge-base --is-ancestor`). A whole-service
+  removal can be retried with an empty `topics` list (R2-03).
+
+### Tests
+- The new tests were run against 0.2.2 first: 38 of the 39 server-level ones fail there.
+  `test_push_guards.py` uses real git with a pre-receive hook to reject pushes, and a real
+  concurrent commit to prove the rollback never discards someone else's work.
+- `tests/fixtures/doc_sync_indexfree.py` is re-copied from the new doc-sync.py, and its
+  drift guard now expects an exact API match (the index step is gone from both).
+- The forge-local SSRF tests pin their allowlist. They set only the cache, so they had been
+  reloading whatever allowlist file the host had.
+
 ## [0.2.2] — 2026-09-29
 
 doc-cache-mcp no longer depends on doc-sync.py's memsearch index step (vikunja#921). This is

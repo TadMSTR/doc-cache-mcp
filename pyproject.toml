@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "doc-cache-mcp"
-version = "0.2.2"
+version = "0.3.0"
 description = "Capability-scoped FastMCP server for the forge documentation cache (list/add/sync + source-URL allowlist)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,6 +26,10 @@ dependencies = [
     "PyYAML>=6.0",
     # Required by the imported doc-sync logic (fetch + HTML->markdown).
     "requests>=2.31",
+    # 2.8.0 fixes two streaming-API flaws (GHSA-gh4c-6fx4-qh6g infinite loop,
+    # GHSA-vxq7-64xx-v4gw unbounded chunk-size buffer) that the provisional tier's capped,
+    # streamed read reaches from hosts nobody approved (audit F-01).
+    "urllib3>=2.8.0",
     "html2text>=2024.2.26",
 ]
 

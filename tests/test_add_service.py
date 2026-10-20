@@ -63,11 +63,15 @@ def test_add_is_idempotent(ws):
     assert len(data["services"]["newsvc"]) == 1  # dedup by topic, no growth
 
 
-def test_add_replaces_topic_url(ws):
+def test_add_with_a_different_url_is_refused_and_names_update_topic(ws):
+    """add is strictly additive now (#647): it used to replace the URL silently, which on
+    a push-enabled deployment degraded to a review branch and poisoned every later push."""
     server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/a")])
-    server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/b")])
-    data = yaml.safe_load(ws.read_text())
-    assert [e["url"] for e in data["services"]["newsvc"]] == ["https://docs.example.com/b"]
+    before = ws.read_text()
+    r = server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/b")])
+    assert r["outcome"] == "refused", r
+    assert "doc_cache_update_topic" in r["reason"]
+    assert ws.read_text() == before
 
 
 def test_add_extends_existing_service(ws):
@@ -176,7 +180,7 @@ def test_git_commit_scopes_to_single_file(tmp_path, monkeypatch):
 
     r = server.doc_cache_add_service("newsvc", [_entry("t", "https://docs.example.com/a")])
     assert "error" not in r, r
-    assert r["commit"]["committed"] is True, r["commit"]
+    assert r["outcome"] == "committed_local", r
 
     # The last commit changed exactly doc-sync.yml.
     files = subprocess.run(

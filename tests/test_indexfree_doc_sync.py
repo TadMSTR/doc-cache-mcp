@@ -54,6 +54,10 @@ def home(tmp_path, monkeypatch):
         "services:\n  svc:\n    - topic: overview\n      url: https://x/README.md\n"
     )
     monkeypatch.setenv("DOC_CACHE_MCP_DOCSYNC_PATH", str(scripts / "doc-sync.py"))
+    # doc-sync classifies every URL before it fetches, so it needs a real allowlist file.
+    (tmp_path / "allow.yml").write_text("hosts: [x]\nforge_endpoints: []\n")
+    monkeypatch.setenv("DOC_CACHE_ALLOWLIST_FILE", str(tmp_path / "allow.yml"))
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
     return tmp_path
 
 
@@ -62,7 +66,7 @@ def ds(home, monkeypatch):
     """The fixture module as the server loads it, with the network stubbed out."""
     m = docsync.load_doc_sync()
     assert m.__file__ == str(home / "scripts" / "doc-sync.py")
-    monkeypatch.setattr(m, "safe_fetch", lambda url, max_redirects=5: _MARKDOWN)
+    monkeypatch.setattr(m, "fetch_classified", lambda url, max_redirects=5: (_MARKDOWN, "trusted"))
     return m
 
 
@@ -98,12 +102,14 @@ async def test_fetch_failure_is_not_ok(ds, monkeypatch, metrics):
     def boom(url, max_redirects=5):
         raise OSError("unreachable")
 
-    monkeypatch.setattr(ds, "safe_fetch", boom)
+    monkeypatch.setattr(ds, "fetch_classified", boom)
     r = await server.doc_cache_sync("svc")
 
     assert r["ok"] is False
     assert r["errors"] == 1
     assert "index_error" not in r
+    assert r["results"][0]["status"] == "failing"
+    assert "unreachable" in r["results"][0]["error"]
 
 
 async def test_dry_run_is_ok(ds, metrics):
@@ -119,16 +125,6 @@ async def test_unknown_service_is_an_error(ds):
 
 
 # --- forge-local: keep the fixture honest about the live script ---------------------
-
-#: What the index step contributed to the live script's namespace. Present in live until
-#: memsearch-retirement-finish-2026-09 part 2 lands, absent in the fixture.
-_INDEX_STEP_NAMES = {
-    "run_memsearch_index",
-    "MEMSEARCH_BIN",
-    "OQP_BASE_URL",
-    "_INDEX_FAILURE_CONSEQUENCE",
-    "subprocess",
-}
 
 
 def _load(path: Path, name: str):
@@ -149,9 +145,11 @@ def test_fixture_matches_live_less_the_index_step(home):
     live = _load(LIVE, "_live_doc_sync_drift_probe")
     fixture = _load(home / "scripts" / "doc-sync.py", "_fixture_doc_sync_drift_probe")
 
-    assert _api(live) - _INDEX_STEP_NAMES == _api(fixture), (
+    assert _api(live) == _api(fixture), (
         "tests/fixtures/doc_sync_indexfree.py no longer mirrors ~/scripts/doc-sync.py — "
-        "re-copy the live script and remove only its index step"
+        "re-copy the live script below the fixture header"
     )
-    live_params = set(inspect.signature(live.sync_service).parameters) - {"index"}
-    assert live_params == set(inspect.signature(fixture.sync_service).parameters)
+    for fn in ("sync_service", "remove_topics", "write_chunks"):
+        assert set(inspect.signature(getattr(live, fn)).parameters) == set(
+            inspect.signature(getattr(fixture, fn)).parameters
+        ), fn

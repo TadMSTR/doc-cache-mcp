@@ -2,31 +2,41 @@
 # ======================================================================================
 # TEST FIXTURE — not the live script. doc-cache-mcp never loads this in production.
 #
-# A copy of host-forge-scripts/scripts/doc-sync.py (as of 5f00749) with the memsearch
-# index step removed: no run_memsearch_index, no `index` kwarg, no MEMSEARCH_BIN, and no
-# `indexed` / `index_error` keys in sync_service()'s result. That is the doc-sync.py
-# memsearch-retirement-finish-2026-09 part 2 ships, and the shape doc-cache-mcp must keep
-# reporting correctly once it does.
+# A verbatim copy of host-forge-scripts/scripts/doc-sync.py (doc-cache-friction-2026-10
+# p1: provisional tier, failure state, remove_topics). The memsearch index step it was
+# first copied without is gone from the live script too, so it is no longer a
+# "less the index step" copy — just a copy.
 #
 # It exists because the tests that load the live script skip wherever it is absent — which
-# includes GitHub CI — so nothing CI ran could see doc-cache-mcp break against an
-# index-free doc-sync. tests/test_indexfree_doc_sync.py loads this through the real
-# load_doc_sync() path instead, unskipped.
+# includes GitHub CI — so nothing CI ran could see doc-cache-mcp break against the doc-sync
+# it ships with. tests/test_indexfree_doc_sync.py loads this through the real
+# load_doc_sync() path instead, unskipped, and on forge checks it still matches live.
 # ======================================================================================
 """
 doc-sync: Fetch, convert, and cache documentation for homelab services.
 
-Saves chunked markdown files to ~/.claude/memory/docs/<service>/. qmd's `docs` collection
-indexes that directory hourly (qmd-refresh), so there is no index step here.
+Saves chunked markdown files to ~/.claude/memory/docs/<service>/, which qmd's `docs`
+collection indexes (host-forge-scripts/index.yml). Agents search it through qmd.
+
+Sources the allowlist classifies as *provisional* (unvetted hosts, doc-cache-friction-2026-10)
+go to ~/.claude/docs-provisional/<service>/ instead. That directory is deliberately outside
+~/.claude/memory: qmd's agent-memory collection and the memory pipeline walk that whole tree,
+so a directory there would be served, and promoted, as agent memory.
 
 Config: ~/docs/doc-sync.yml
-Cache:  ~/.claude/memory/docs/
+Cache:  ~/.claude/memory/docs/ (trusted), ~/.claude/docs-provisional/ (provisional)
 Log:    ~/docs/doc-sync.log
 
 Reusable API (imported by doc-cache-mcp — single source of truth for chunk/write logic):
     load_config() -> dict
     load_state()  -> dict
     sync_service(service, *, force=False, dry_run=False) -> dict
+    remove_topic(service, topic) -> dict
+    remove_topics(service, topics) -> dict
+
+State entries carry `synced` (date of the last SUCCESS, or None if there never was one) and,
+while a topic is failing, `last_attempt`, `last_error` and `consecutive_failures`. A failure
+used to leave the entry untouched, so a dead source showed its last good date forever.
 
 The `sync_service()` entry point and the CLI `main()` share the same per-service core
 (`_sync_service_entries`) and the same `state_lock()`, so the doc-cache-mcp server and the
@@ -40,6 +50,7 @@ import json
 import time
 import fcntl
 import hashlib
+import subprocess
 import yaml
 import logging
 import requests
@@ -47,7 +58,7 @@ import html2text
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 # The shared source-URL allowlist lives next to this script. When doc-sync.py is imported
 # by-path (e.g. by doc-cache-mcp) its own directory is not on sys.path — add it so the
@@ -57,6 +68,11 @@ import doc_cache_allowlist as _allow
 
 CONFIG_FILE  = Path.home() / "docs" / "doc-sync.yml"
 CACHE_DIR    = Path.home() / ".claude" / "memory" / "docs"
+# Must agree with doc-cache-mcp's `provisional_cache_dir` setting: same env var, same default.
+PROVISIONAL_CACHE_DIR = Path(os.environ.get(
+    "DOC_CACHE_MCP_PROVISIONAL_CACHE_DIR",
+    Path.home() / ".claude" / "docs-provisional",
+)).expanduser()
 MANIFEST     = Path.home() / "docs" / "cache-manifest.md"
 LOG_FILE     = Path.home() / "docs" / "doc-sync.log"
 STATE_FILE   = Path.home() / "docs" / "doc-sync-state.json"
@@ -184,34 +200,112 @@ def _get_allowlist() -> dict:
     return _ALLOWLIST_CACHE
 
 
-def safe_fetch(url: str, max_redirects: int = 5) -> str:
-    """Fetch a URL with the docs-cache allowlist enforced AT FETCH TIME (SSRF / cache
-    poisoning guard, F-01).
+def refuse_open_edit(url: str) -> None:
+    """Raise AllowlistError if the URL is an open-edit source (a public wiki).
 
-    The URL — and every redirect hop — is validated against the allowlist immediately
+    The rule set lives in doc_cache_allowlist now (vikunja#1167), so add time and fetch time
+    run the same code; this wrapper keeps the old name for callers and tests.
+    """
+    try:
+        allowlist = _get_allowlist()
+    except _allow.AllowlistError:
+        allowlist = None  # the floor still applies; classify_url refuses the URL anyway
+    _allow.refuse_open_edit(url, allowlist)
+
+
+def fetch_classified(url: str, max_redirects: int = 5) -> tuple[str, str]:
+    """Fetch a URL with the docs-cache allowlist enforced AT FETCH TIME (SSRF / cache
+    poisoning guard, F-01). Returns ``(text, trust)``.
+
+    The URL — and every redirect hop — is classified against the allowlist immediately
     before the request, in this process, so the DNS resolve-and-recheck actually protects
     the fetch (closing the add-time/fetch-time TOCTOU). Redirects are never auto-followed:
-    each ``Location`` is re-validated before it is fetched, so an allowlisted host cannot
+    each ``Location`` is re-classified before it is fetched, so an allowlisted host cannot
     301/302 the fetcher to an internal address.
 
-    Raises ``doc_cache_allowlist.AllowlistError`` (refused), a requests error, or
-    ``requests.TooManyRedirects``.
+    ``trust`` is the LOWEST tier of any hop: a provisional URL that redirects to a trusted
+    host is still provisional content, because the provisional host chose where it went.
+    The other direction is REFUSED: a trusted URL that redirects to a provisional host would
+    otherwise yield unvetted content that no TTL, ``max_hosts`` count or promotion event
+    ever sees, because all three key on the configured URL (audit F-02). That is also what
+    v1 did with the same redirect.
+
+    A provisional fetch is capped at the allowlist's ``provisional.max_bytes``; a trusted
+    one is read exactly as it always was. TLS certificate verification is the control that
+    stops a DNS rebind between the recheck and the connection (an internal service would
+    need a valid certificate for the attacker's name), so a session with it disabled is
+    refused for provisional fetches (audit F-04).
+
+    Raises ``doc_cache_allowlist.AllowlistError`` (refused), a requests error,
+    ``requests.TooManyRedirects``, or ``ValueError`` (provisional body over the cap).
     """
     allowlist = _get_allowlist()
     current = url
+    trust = _allow.TRUSTED
     for _ in range(max_redirects + 1):
-        _allow.validate_url(current, allowlist)
-        r = SESSION.get(current, timeout=30, allow_redirects=False)
+        verdict = _allow.classify_url(current, allowlist)
+        if current != url and trust == _allow.TRUSTED and verdict.trust == _allow.PROVISIONAL:
+            raise _allow.AllowlistError(
+                f"a trusted source redirected to an unvetted host ({verdict.host!r}); "
+                "refused — register that URL itself if it should be cached"
+            )
+        trust = _allow.lower_trust(trust, verdict.trust)
+        if trust == _allow.PROVISIONAL and getattr(SESSION, "verify", True) is False:
+            raise _allow.AllowlistError(
+                "TLS verification is disabled; provisional fetches rely on it (rebind guard)"
+            )
+        if trust == _allow.PROVISIONAL:
+            old = _urllib3_too_old()
+            if old:
+                raise _allow.AllowlistError(f"provisional fetch refused: {old} (audit F-01)")
+        if trust == _allow.PROVISIONAL:
+            r = SESSION.get(current, timeout=30, allow_redirects=False, stream=True)
+        else:
+            r = SESSION.get(current, timeout=30, allow_redirects=False)
         if r.status_code in (301, 302, 303, 307, 308):
             loc = r.headers.get("Location")
-            if not loc:
-                r.raise_for_status()
-                return r.text
-            current = urljoin(current, loc)
-            continue
+            if loc:
+                _close(r)
+                current = urljoin(current, loc)
+                continue
         r.raise_for_status()
-        return r.text
+        if trust == _allow.PROVISIONAL:
+            return _read_capped(r, allowlist["provisional"]["max_bytes"], current), trust
+        return r.text, trust
     raise requests.TooManyRedirects(f"exceeded {max_redirects} redirects fetching {url}")
+
+
+def _close(r) -> None:
+    close = getattr(r, "close", None)
+    if close:
+        close()
+
+
+def _read_capped(r, max_bytes: int, url: str) -> str:
+    """Read at most ``max_bytes`` of a streamed body; refuse rather than truncate.
+
+    Truncating would cache half a page as if it were the page. An unvetted host serving
+    more than the cap is a refusal with the cap named, not a silent partial.
+    """
+    try:
+        declared = int(r.headers.get("Content-Length", "0"))
+    except ValueError:
+        declared = 0
+    if declared > max_bytes:
+        _close(r)
+        raise ValueError(f"provisional source exceeds max_bytes ({declared} > {max_bytes}): {url}")
+    buf = bytearray()
+    for chunk in r.iter_content(chunk_size=65536):
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            _close(r)
+            raise ValueError(f"provisional source exceeds max_bytes ({max_bytes}): {url}")
+    return bytes(buf).decode(r.encoding or "utf-8", errors="replace")
+
+
+def safe_fetch(url: str, max_redirects: int = 5) -> str:
+    """:func:`fetch_classified` for callers that only want the text."""
+    return fetch_classified(url, max_redirects)[0]
 
 
 def to_markdown(content: str, url: str) -> str:
@@ -280,19 +374,63 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
 
 
-def write_chunks(service: str, topic: str, url: str, chunks: list[dict]) -> list[Path]:
+def _tier_dir(trust: str) -> Path:
+    return PROVISIONAL_CACHE_DIR if trust == _allow.PROVISIONAL else CACHE_DIR
+
+
+def _check_service_key(service: str) -> None:
     # Belt-and-suspenders: the service key becomes a directory name. The MCP already
     # validates it, but the cron iterates raw config keys, so validate here too (F-07).
-    if not _SERVICE_KEY_RE.match(service):
+    if not _SERVICE_KEY_RE.fullmatch(service):  # `$` alone admits a trailing newline
         raise ValueError(f"unsafe service key {service!r}: refusing to use as a directory name")
+
+
+def _topic_files(out_dir: Path, topic: str) -> list[Path]:
+    """The chunk files that belong to ``topic`` — by their frontmatter, not just the name.
+
+    The ``<slug>-*.md`` glob alone also matches every topic whose slug extends this one
+    (``install`` matches ``install-docker-compose-00-....md``), so writing or removing one
+    topic used to delete its neighbour's chunks too.
+    """
+    out = []
+    for f in out_dir.glob(f"{slug(topic)}-*.md"):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                head = [next(fh, "") for _ in range(8)]
+        except OSError:
+            continue
+        if f"topic: {topic}\n" in head:
+            out.append(f)
+    return out
+
+
+def _unlink_topic(service: str, topic: str, trust: str) -> list[Path]:
+    out_dir = _tier_dir(trust) / service
+    if not out_dir.is_dir():
+        return []
+    gone = _topic_files(out_dir, topic)
+    for f in gone:
+        f.unlink()
+    return gone
+
+
+def write_chunks(
+    service: str, topic: str, url: str, chunks: list[dict], trust: str = "trusted"
+) -> list[Path]:
+    _check_service_key(service)
 
     today      = date.today().isoformat()
     expires    = (date.today() + timedelta(days=90)).isoformat()
-    out_dir    = CACHE_DIR / service
+    out_dir    = _tier_dir(trust) / service
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for old in out_dir.glob(f"{slug(topic)}-*.md"):
+    olds = _topic_files(out_dir, topic)
+    for old in olds:
         old.unlink()
+    # A topic that changed tier (promoted, or repointed onto an unvetted host) must not
+    # leave its chunks in the other tier's directory, still labelled as they were.
+    other = _allow.TRUSTED if trust == _allow.PROVISIONAL else _allow.PROVISIONAL
+    olds += _unlink_topic(service, topic, other)
 
     written = []
     for i, chunk in enumerate(chunks):
@@ -306,6 +444,7 @@ def write_chunks(service: str, topic: str, url: str, chunks: list[dict]) -> list
             f"topic: {topic}\n"
             f"section: {chunk['title']}\n"
             f"source_url: {url}\n"
+            f"trust: {trust}\n"
             f"created: {today}\n"
             f"expires: {expires}\n"
             f"tags: [doc-cache, {service}, docs]\n"
@@ -314,7 +453,49 @@ def write_chunks(service: str, topic: str, url: str, chunks: list[dict]) -> list
         fpath.write_text(frontmatter + chunk["body"])
         written.append(fpath)
 
+    REMOVED_PATHS.update(set(olds) - set(written))
     return written
+
+
+# ── Metadata index prune (vikunja#1162) ───────────────────────────────────────
+#
+# memory-expire prunes .metadata.db at 03:00, the same minute this cron starts
+# deleting and re-chunking files, so rows for files removed here outlived the
+# prune by a day and tripped the 02:30 memory-archive-mirror. doc-sync now
+# prunes after itself whenever it removed a file. A rewrite to the same path
+# leaves its row valid, so only paths that were not rewritten count.
+
+REMOVED_PATHS: set[Path] = set()
+INDEX_SCRIPT = Path(__file__).resolve().parent / "memory-metadata-index.py"
+PRUNE_RETRY_DELAY = 15.0
+
+
+def prune_metadata_index(retry_delay: float | None = None) -> bool:
+    """Run memory-metadata-index.py --prune. False (logged) on failure.
+
+    One retry: memory-expire's own prune can hold the SQLite lock in the
+    same minute, and a lock collision is not worth a CronJobDown page.
+    """
+    if not INDEX_SCRIPT.is_file():
+        log.error(f"index prune: {INDEX_SCRIPT} not found")
+        return False
+    for attempt in (1, 2):
+        try:
+            result = subprocess.run(
+                [sys.executable, str(INDEX_SCRIPT), "--prune"],
+                capture_output=True, text=True, timeout=600,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            log.error(f"index prune: attempt {attempt} failed to run: {e}")
+        else:
+            if result.returncode == 0:
+                log.info(f"index prune: ok ({len(REMOVED_PATHS)} file(s) removed this run)")
+                return True
+            tail = (result.stderr or "").strip().splitlines()[-3:]
+            log.error(f"index prune: attempt {attempt} exited {result.returncode}: {' | '.join(tail)}")
+        if attempt == 1:
+            time.sleep(PRUNE_RETRY_DELAY if retry_delay is None else retry_delay)
+    return False
 
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
@@ -326,8 +507,8 @@ def write_manifest(state: dict):
         lines.append(f"\n## {service}\n")
         for entry in entries:
             lines.append(
-                f"- **{entry['topic']}** — {entry['chunks']} chunks — "
-                f"synced {entry['synced']} — `~/.claude/memory/docs/{service}/`  \n"
+                f"- **{entry['topic']}** — {entry.get('chunks', 0)} chunks — "
+                f"synced {entry.get('synced') or 'never'} — `{_tier_dir(entry.get('trust', 'trusted'))}/{service}/`  \n"
                 f"  Source: {entry['url']}"
             )
     MANIFEST.write_text("\n".join(lines) + "\n")
@@ -360,52 +541,165 @@ def load_config() -> dict:
 
 # ── Sync core ─────────────────────────────────────────────────────────────────
 
-def sync_entry(service: str, entry: dict) -> int:
+#: At most this many topics may lose their TRUSTED chunks to expiry per sync call — one cron
+#: run, or one `sync_service` call from doc-cache-mcp. Expiry from the trusted tier means a
+#: host was demoted; a call that demotes more than a handful is far likelier a bad allowlist
+#: edit than intent (audit R2-01). Past the limit the chunks are left in place and the topic
+#: is `failing`: the cron run fails and healthchecks alerts. It is a brake, not a total
+#: bound: repeated MCP syncs of one service each get a fresh budget (audit R3-01), so the
+#: first line of defence is load_allowlist refusing a file that trusts nothing.
+TRUSTED_EXPIRY_LIMIT = 5
+_trusted_expiries = 0
+
+#: The streaming read below is only safe on urllib3 >= 2.8.0 (GHSA-gh4c-6fx4-qh6g infinite
+#: loop, GHSA-vxq7-64xx-v4gw unbounded chunk-size line). A provisional host is anyone's
+#: server, so on an older urllib3 provisional fetches are refused rather than trusted to a
+#: deploy step (audit F-01 / R2-02).
+MIN_URLLIB3 = (2, 8, 0)
+
+
+def _reset_run_counters() -> None:
+    global _trusted_expiries
+    _trusted_expiries = 0
+
+
+def _urllib3_too_old() -> str | None:
+    try:
+        import urllib3
+    except ImportError:  # only in hermetic tests that stub requests out entirely
+        return None
+    try:
+        have = tuple(int(x) for x in urllib3.__version__.split(".")[:3])
+    except ValueError:
+        return f"unparseable urllib3 version {urllib3.__version__!r}"
+    if have < MIN_URLLIB3:
+        return f"urllib3 {urllib3.__version__} < {'.'.join(map(str, MIN_URLLIB3))}"
+    return None
+
+
+def _provisional_expired(entry: dict, ttl_days: int) -> bool:
+    """True if a provisional entry is past its TTL. A missing or bad `added` is expired:
+    unvetted content with no provenance date fails closed, not open-ended."""
+    try:
+        added = date.fromisoformat(str(entry.get("added")))
+    except ValueError:
+        return True
+    return date.today() > added + timedelta(days=ttl_days)
+
+
+def sync_entry_detail(service: str, entry: dict) -> dict:
+    """Sync one entry. Returns ``{status, chunks, trust, error}``; never raises.
+
+    ``status`` is ``ok``, ``failing`` or ``expired_provisional``. Trust is recomputed from
+    the allowlist here, on every run: the entry's own ``trust`` field is informational, so
+    promoting a host in the allowlist is the whole promotion step.
+    """
     topic = entry["topic"]
     url   = entry["url"]
 
     log.info(f"[{service}] {topic} — {url}")
     try:
-        raw      = safe_fetch(url)
+        allowlist = _get_allowlist()
+        tier = _allow.classify_url(url, allowlist).trust
+        if tier == _allow.PROVISIONAL and _provisional_expired(
+            entry, allowlist["provisional"]["ttl_days"]
+        ):
+            # Both tiers: a host Ted DEMOTED from `hosts` lands here too (it has no
+            # `added`), and its chunks are in the trusted, indexed directory (audit F-05) —
+            # but not past TRUSTED_EXPIRY_LIMIT in one run (audit R2-01).
+            global _trusted_expiries
+            trusted_dir = CACHE_DIR / service
+            has_trusted = trusted_dir.is_dir() and bool(_topic_files(trusted_dir, topic))
+            if has_trusted and _trusted_expiries >= TRUSTED_EXPIRY_LIMIT:
+                msg = (
+                    f"more than {TRUSTED_EXPIRY_LIMIT} topics would lose trusted chunks to "
+                    "expiry this run; left in place (check the allowlist's hosts)"
+                )
+                log.error(f"[{service}] {topic} — {msg}")
+                return {"status": "failing", "chunks": -1, "trust": tier, "error": msg}
+            gone = _unlink_topic(service, topic, _allow.PROVISIONAL)
+            if has_trusted:
+                _trusted_expiries += 1
+                gone += _unlink_topic(service, topic, _allow.TRUSTED)
+            REMOVED_PATHS.update(gone)
+            log.warning(
+                f"[{service}] {topic} — provisional source past its TTL and not promoted; "
+                f"skipped, {len(gone)} chunk(s) removed"
+            )
+            return {"status": "expired_provisional", "chunks": 0, "trust": tier, "error": None}
+        raw, trust = fetch_classified(url)
         md       = to_markdown(raw, url)
         chunks   = chunk_by_headings(md)
         if not chunks:
             log.warning(f"[{service}] {topic} — no chunks extracted, skipping")
-            return 0
-        written  = write_chunks(service, topic, url, chunks)
-        log.info(f"[{service}] {topic} — {len(written)} chunks written")
-        return len(written)
+            return {"status": "ok", "chunks": 0, "trust": trust, "error": None}
+        written  = write_chunks(service, topic, url, chunks, trust)
+        log.info(f"[{service}] {topic} — {len(written)} chunks written ({trust})")
+        return {"status": "ok", "chunks": len(written), "trust": trust, "error": None}
     except Exception as e:
         log.error(f"[{service}] {topic} — FAILED: {e}")
-        return -1
+        return {"status": "failing", "chunks": -1, "trust": None, "error": str(e)[:200]}
+
+
+def sync_entry(service: str, entry: dict) -> int:
+    """Chunk count, or -1 on failure. See :func:`sync_entry_detail`."""
+    return sync_entry_detail(service, entry)["chunks"]
 
 
 def _sync_service_entries(service: str, entries: list[dict], state: dict) -> dict:
     """Sync one service's entries into `state` (mutated in place). No lock / no disk
     persistence of state here — the caller owns state_lock(), save_state() and the
     manifest. Returns a per-service summary.
+
+    A failure records `last_attempt`, `last_error` and `consecutive_failures` and leaves
+    `synced` (the last success) alone; a success clears them. An expired provisional topic
+    is a skip, not an error: it does not count toward `errors` or the CLI exit code.
     """
     today = date.today().isoformat()
     if service not in state:
         state[service] = []
 
-    synced = errors = chunks = 0
+    synced = errors = chunks = expired = 0
     results = []
     for entry in entries:
         topic = entry["topic"]
         url   = entry["url"]
-        n = sync_entry(service, entry)
-        if n >= 0:
+        d = sync_entry_detail(service, entry)
+        prev = next((e for e in state[service] if e["topic"] == topic), None)
+        state[service] = [e for e in state[service] if e["topic"] != topic]
+        if d["status"] == "ok":
             synced += 1
-            chunks += n
-            state[service] = [e for e in state[service] if e["topic"] != topic]
-            state[service].append({"topic": topic, "url": url, "chunks": n, "synced": today})
-            results.append({"topic": topic, "url": url, "chunks": n})
+            chunks += d["chunks"]
+            state[service].append({
+                "topic": topic, "url": url, "chunks": d["chunks"], "synced": today,
+                "trust": d["trust"],
+            })
+            results.append({"topic": topic, "url": url, "chunks": d["chunks"],
+                            "status": "ok", "trust": d["trust"]})
+        elif d["status"] == "expired_provisional":
+            expired += 1
+            state[service].append({
+                "topic": topic, "url": url, "chunks": 0,
+                "synced": (prev or {}).get("synced"), "trust": d["trust"],
+                "expired": True,
+            })
+            results.append({"topic": topic, "url": url, "chunks": 0,
+                             "status": "expired_provisional", "trust": d["trust"]})
         else:
             errors += 1
-            results.append({"topic": topic, "url": url, "error": "fetch/convert failed"})
+            kept = dict(prev) if prev else {"topic": topic, "url": url, "chunks": 0, "synced": None}
+            kept.pop("expired", None)
+            kept.update({
+                "last_attempt": today,
+                "last_error": d["error"],
+                "consecutive_failures": int(kept.get("consecutive_failures", 0) or 0) + 1,
+            })
+            state[service].append(kept)
+            results.append({"topic": topic, "url": url, "status": "failing",
+                            "error": d["error"]})
 
-    return {"entries_synced": synced, "chunks": chunks, "errors": errors, "results": results}
+    return {"entries_synced": synced, "chunks": chunks, "errors": errors,
+            "expired": expired, "results": results}
 
 
 def sync_service(service: str, *, force: bool = False, dry_run: bool = False) -> dict:
@@ -419,7 +713,9 @@ def sync_service(service: str, *, force: bool = False, dry_run: bool = False) ->
         {service, entries_synced, chunks, errors, ok, dry_run, results:[...]}
 
         `errors` counts per-entry fetch/convert failures. `ok` is False if any entry
-        failed.
+        failed. The memsearch index step, and with it the `indexed` / `index_error`
+        keys, were removed when memsearch retired (memsearch-retirement-finish-2026-09
+        p2); qmd's `docs` collection indexes the cache on its own schedule.
 
     Raises:
         FileNotFoundError if doc-sync.yml is missing.
@@ -445,6 +741,9 @@ def sync_service(service: str, *, force: bool = False, dry_run: bool = False) ->
         }
 
     with state_lock():
+        # Inside the lock: reset outside it let a second caller zero the budget while the
+        # first was mid-loop (audit R3-01).
+        _reset_run_counters()
         state = load_state()
         summary = _sync_service_entries(service, entries, state)
         save_state(state)
@@ -455,10 +754,56 @@ def sync_service(service: str, *, force: bool = False, dry_run: bool = False) ->
         "entries_synced": summary["entries_synced"],
         "chunks": summary["chunks"],
         "errors": summary["errors"],
+        "expired": summary.get("expired", 0),
         "ok": summary["errors"] == 0,
         "dry_run": False,
         "results": summary["results"],
     }
+
+
+# ── Removal ───────────────────────────────────────────────────────────────────
+
+def remove_topics(service: str, topics: list[str]) -> dict:
+    """Delete these topics' chunks (both tiers) and state entries, then prune the index.
+
+    The config entry is the caller's to remove (doc-cache-mcp edits doc-sync.yml through
+    its guarded commit path); this removes everything doc-sync itself wrote. Removing a
+    topic that has no chunks or state is not an error — the result says what was found.
+    """
+    _check_service_key(service)
+    removed: list[Path] = []
+    state_removed: list[str] = []
+    with state_lock():
+        state = load_state()
+        for topic in topics:
+            for tier in (_allow.TRUSTED, _allow.PROVISIONAL):
+                removed += _unlink_topic(service, topic, tier)
+            before = len(state.get(service, []))
+            state[service] = [e for e in state.get(service, []) if e["topic"] != topic]
+            if len(state[service]) != before:
+                state_removed.append(topic)
+        if service in state and not state[service]:
+            del state[service]
+        for tier in (_allow.TRUSTED, _allow.PROVISIONAL):
+            d = _tier_dir(tier) / service
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        save_state(state)
+        write_manifest(state)
+    REMOVED_PATHS.update(removed)
+    pruned = prune_metadata_index() if removed else None
+    return {
+        "service": service,
+        "topics": list(topics),
+        "files_removed": len(removed),
+        "state_removed": state_removed,
+        "pruned": pruned,
+    }
+
+
+def remove_topic(service: str, topic: str) -> dict:
+    """:func:`remove_topics` for one topic."""
+    return remove_topics(service, [topic])
 
 
 # ── Main (CLI) ────────────────────────────────────────────────────────────────
@@ -492,18 +837,32 @@ def main():
 
     total_synced = 0
     total_errors = 0
+    total_expired = 0
 
     with state_lock():
+        _reset_run_counters()  # one budget per cron run, taken under the lock (R3-01)
         state = load_state()
         for service, entries in services.items():
             summary = _sync_service_entries(service, entries, state)
             total_synced += summary["entries_synced"]
             total_errors += summary["errors"]
+            total_expired += summary.get("expired", 0)
         save_state(state)
         write_manifest(state)
 
-    log.info(f"Sync complete. {total_synced} entries synced, {total_errors} errors.")
+    log.info(
+        f"Sync complete. {total_synced} entries synced, {total_errors} errors, "
+        f"{total_expired} expired provisional skipped."
+    )
 
+    # A failed prune fails the run, unlike memory-expire's warning: a stale row
+    # surfaces a day later in a different job, which is how #1162 hid.
+    if REMOVED_PATHS and not prune_metadata_index():
+        total_errors += 1
+
+    # Any fetch/convert error is a failed run, so the 03:00 doc-sync-daily cron exits 1.
+    # This used to also cover a failed memsearch index (vikunja#372); that step went with
+    # memsearch (memsearch-retirement-finish-2026-09 p2) and qmd indexes the cache itself.
     if total_errors:
         sys.exit(1)
 

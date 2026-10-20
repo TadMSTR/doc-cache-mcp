@@ -1,67 +1,71 @@
-"""Constrained push of the docs-cache config commit.
+"""The docs-cache config write path: every call finishes or fails, and says which.
 
-``doc_cache_add_service`` writes one file and commits it, then stops. The commit sits on
-local ``main`` forever, because the agent that called the tool has no git write access —
-it is precisely that lack of access the MCP exists to discharge. So the tool reported
-``committed: true`` for an operation nobody could finish (vikunja#363).
+``doc-sync.yml`` lives in a shared git repo that a cron and humans also use. A config change
+from this tool is one atomic sequence, run under a process-wide lock by the server:
 
-This module finishes it, under guards, because "an MCP pushes to a shared repo's main
-unattended" is a real privilege and should read like one.
+1. **Precondition, before anything is written** (:func:`precondition`). The config file has
+   no uncommitted changes, and — when pushing — the checkout is on the target branch and is
+   exactly level with ``<remote>/<branch>`` after a fetch. Anything else is ``refused``,
+   naming the condition ("local main is 2 behind origin/main; ..."). Nothing is written.
+2. **Write, then commit as the tool identity** (:func:`commit_change`). Commits are authored
+   as ``doc-cache-mcp`` rather than as the host user, passed per invocation with ``-c`` so
+   nobody else's identity in the same checkout changes. The commit is path-limited to the
+   config file, so nothing else staged in the checkout is swept into it.
+3. **Classify the change** — ``additive``, ``repoint`` or ``remove`` — from git's own view
+   of the commit, and roll back if it is not the kind the calling tool performs. Adding
+   cannot repoint; repointing cannot remove. The classification is recorded in the result
+   and in the audit event.
+4. **Guards, then push the validated SHA.** Every commit in the push range must be the
+   tool's (no foreign commits ride along), and the range may touch the config file and
+   nothing else. The push sends the exact SHA the guards inspected, never the ``HEAD`` ref:
+   git re-resolves ``HEAD`` at push time, so anything committed in between would otherwise
+   ride along unchecked.
+5. **If the push fails, roll back this call's own commit**, and only that: a compare-and-swap
+   of the branch ref from this commit back to its parent (``git update-ref HEAD <pre>
+   <sha>``), then a restore of the config file — only if nobody has edited it since. A
+   concurrent commit makes the swap fail, and then nothing is reset: the result is
+   ``stranded`` and says exactly what is left where. The next call's precondition then
+   refuses, naming it, so a stranded commit cannot quietly poison later calls.
 
-Guards, in order. Every one of them is fail-closed: if a guard cannot be *evaluated*, that
-is a refusal, not a pass.
+The ``outcome`` of a call is one of:
 
-1. **Distinct commit identity.** Commits are authored as ``doc-cache-mcp`` rather than as
-   the host user, so tool commits are distinguishable from human ones — and so guard 3
-   has something to match on.
-2. **A dedicated deploy key**, write-scoped to the single target repo, used with
-   ``IdentitiesOnly=yes`` so ssh cannot silently fall back to the host user's ambient key
-   (which reaches every repo that key can reach).
-3. **No foreign commits.** Every commit in the push range must be authored by the
-   identity from guard 1. This is the guard that stops the tool sweeping up somebody
-   else's unreviewed work-in-progress on the way to pushing its own one-line change.
+``pushed``           committed and on ``<remote>/<branch>``.
+``committed_local``  committed; pushing is disabled (``git_push=false``, the public default).
+``written``          file written; git is disabled (``git_commit=false``).
+``unchanged``        the requested state already holds; nothing written.
+``rolled_back``      a step after the write failed; the commit and file were undone.
+``refused``          a precondition or input check failed; nothing was written.
+``stranded``         the push failed and the rollback was unsafe; see ``reason``.
 
-   The push sends **the exact SHA the guards inspected**, never the ``HEAD`` ref. Git
-   re-resolves ``HEAD`` at push time, so pushing the ref would let anything committed
-   between evaluation and push ride along unchecked — this guard defeated by a race
-   rather than by a missing check. Found by the security audit of this module, not by
-   its tests, which only ever exercised static state.
-4. **Path allowlist at push time**, not just at commit time. The push range must touch
-   the config file and nothing else — defence in depth if guard 3 is ever bypassed.
-5. **Additive-only.** The config as it will land must be a purely additive change to the
-   config already on the remote — no service or topic removed, no existing URL
-   re-pointed. The tool's semantic is "add a service"; enforce it rather than relying on
-   it emerging from the merge logic.
+``reason`` describes **this call only**.
 
-   This is evaluated at push time, against ``<remote>/<branch>`` versus ``HEAD``, not
-   against whatever this process happened to read before writing. That catches a
-   non-additive change introduced by *any* commit in the range, not just by this call.
-   It is also why re-pointing a URL degrades to a review branch rather than erroring:
-   replacing an existing topic's URL is documented, tested, idempotent behaviour of
-   ``doc_cache_add_service``, so it must stay possible — it just should not land on a
-   shared branch unattended.
-6. **An audit event per decision**, outside git, so the trail survives a force-push.
-7. **Degrade, do not fail.** When a guard trips, the commit is pushed to a review branch
-   instead of to the target branch, and the URL to open a pull request is returned. The
-   normal case for this tool is a single additive line in one file and will pass every
-   guard; a review branch should be rare and each one worth a human's attention.
+**What this replaces.** v0.2 degraded any guard refusal to a pushed *review branch*, and left
+its commit on local ``main``. Every later call's push range then contained that commit, so
+every later call degraded too, with a ``reason`` describing the earlier one, and reported
+``pushed: false`` while it had in fact pushed a branch. Five review branches were produced
+and none was drained by review. Git history on the target branch, the per-decision audit
+event and the agent-bus event make every change attributable and revertible after the fact,
+which is the review that actually happens. The additive-only rule is no longer a push
+blocker for the same reason: non-additive changes now come only from the explicit update and
+remove tools, so they are intended, and step 3 holds each tool to its own kind.
 
-**Deviation from the build plan, deliberate.** The plan specified opening a pull request
-via the forge API on degradation. Doing that needs a Gitea API token, which is
-*account-wide* — it would hand this service far broader reach than the single-repo deploy
-key guard 2 exists to bound, undoing most of that guard's value to save the operator one
-click. Pushing a review branch with the key we already have reaches the same outcome
-(human review, nothing stranded locally, a URL returned) at no extra credential.
+**Credentials.** Pushes use a dedicated deploy key, write-scoped to the one repo, with
+``-F /dev/null``, ``IdentitiesOnly=yes`` and no ``SSH_AUTH_SOCK``, so no other key — not
+the agent's, and not one named in ``~/.ssh/config`` — can be used even by mistake. No
+forge API token: a review flow that needed one would hand this service account-wide reach
+to save the operator a click.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import re
 import shlex
+import signal
 import subprocess
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -69,22 +73,19 @@ from typing import Any
 import structlog
 import yaml
 
+from .observability import emit_metric
+
 log = structlog.get_logger()
 
 _GIT_TIMEOUT_S = 60
 
-
-#: ``service`` reaches a git ref name in :func:`_degrade`. server.py validates it before
-#: calling, but the guard is repeated here rather than assumed: this is an exported
-#: function, and a validation that lives only at one call site is one refactor away from
-#: not running at all (IV-01).
-#:
-#: Stricter than server.py's ``_SERVICE_RE`` in one respect: a leading ``-`` is refused.
-#: ``^[A-Za-z0-9_-]+$`` admits ``--force``, which is a legal service name today but reads
-#: as an option anywhere it is not carefully positioned. Nothing here puts it in such a
-#: position and none of the 63 configured services starts with a dash, so this costs
-#: nothing and removes the question.
-_SAFE_SERVICE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+PUSHED = "pushed"
+COMMITTED_LOCAL = "committed_local"
+WRITTEN = "written"
+UNCHANGED = "unchanged"
+ROLLED_BACK = "rolled_back"
+REFUSED = "refused"
+STRANDED = "stranded"
 
 
 class PushRefused(Exception):
@@ -95,9 +96,19 @@ class PushRefused(Exception):
         self.reason = reason
 
 
-# ---------------------------------------------------------------------------
-# Guard 1 — commit identity
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class GitTarget:
+    """Where and how a config change is committed. Built once per call by the server."""
+
+    repo: Path
+    rel: str
+    remote: str
+    branch: str
+    identity_name: str
+    identity_email: str
+    push: bool
+    deploy_key: Path | None
+    audit_dir: Path | None
 
 
 def identity_args(name: str, email: str) -> list[str]:
@@ -110,48 +121,41 @@ def identity_args(name: str, email: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Guard 5 — additive-only validation
+# Change classification
 # ---------------------------------------------------------------------------
 
 
-def validate_additive(before: dict, after: dict) -> str | None:
-    """Return a refusal reason if *after* is not a purely additive change to *before*.
+def _topics(services: dict, name: str) -> dict[str, dict]:
+    return {
+        e["topic"]: e for e in (services.get(name) or []) if isinstance(e, dict) and "topic" in e
+    }
 
-    Additive means: no service disappears, no topic disappears, and no existing topic's
-    URL changes to something different. Adding services, adding topics, and re-adding a
-    topic with an identical URL are all fine.
 
-    Re-pointing an existing topic at a new URL is refused even though the tool's docstring
-    calls it idempotent — a URL swap is how a cache-poisoning attempt would look, and it
-    is not what "add a service" means. It stays possible by editing the file directly.
+def classify_change(before: dict | None, after: dict | None) -> str:
+    """``additive``, ``repoint``, ``remove``, ``mixed`` or ``none``.
+
+    ``additive``: services or topics appear, nothing existing changes. ``repoint``: an
+    existing topic's entry changes (its URL, or its informational trust fields). ``remove``:
+    a topic or service disappears. More than one kind at once is ``mixed`` — no tool
+    performs that, so it is always rolled back.
     """
-    before_services = (before or {}).get("services") or {}
-    after_services = (after or {}).get("services") or {}
-
-    for name in before_services:
-        if name not in after_services:
-            return f"refuses to remove service {name!r}"
-
-    for name, before_entries in before_services.items():
-        before_urls = {
-            e["topic"]: e.get("url")
-            for e in (before_entries or [])
-            if isinstance(e, dict) and "topic" in e
-        }
-        after_urls = {
-            e["topic"]: e.get("url")
-            for e in (after_services.get(name) or [])
-            if isinstance(e, dict) and "topic" in e
-        }
-        for topic, url in before_urls.items():
-            if topic not in after_urls:
-                return f"refuses to remove topic {topic!r} from service {name!r}"
-            if after_urls[topic] != url:
-                return (
-                    f"refuses to change the url of existing topic {topic!r} in service "
-                    f"{name!r} — this tool only adds"
-                )
-    return None
+    b = (before or {}).get("services") or {}
+    a = (after or {}).get("services") or {}
+    kinds: set[str] = set()
+    for name in set(b) | set(a):
+        bt, at = _topics(b, name), _topics(a, name)
+        if name in b and name not in a:
+            kinds.add("remove")
+            continue
+        if set(bt) - set(at):
+            kinds.add("remove")
+        if set(at) - set(bt):
+            kinds.add("additive")
+        if any(bt[t] != at[t] for t in set(bt) & set(at)):
+            kinds.add("repoint")
+    if not kinds:
+        return "none"
+    return kinds.pop() if len(kinds) == 1 else "mixed"
 
 
 # ---------------------------------------------------------------------------
@@ -162,18 +166,20 @@ def validate_additive(before: dict, after: dict) -> str | None:
 def _ssh_command(deploy_key: Path) -> str:
     """ssh invocation pinned to the deploy key.
 
-    ``IdentitiesOnly=yes`` is the load-bearing option: without it ssh offers every key the
-    agent and the default paths provide, so a misconfigured deploy key would silently
-    succeed using the host user's ambient credentials — the exact broad-reach credential
-    guard 2 exists to avoid, and it would look like it was working.
-
+    ``-F /dev/null`` and ``IdentitiesOnly=yes`` together are the load-bearing part.
+    ``IdentitiesOnly`` alone still offers every *configured* identity, and that includes
+    ``IdentityFile`` lines in ``~/.ssh/config``: on forge it offered the host user's
+    passphraseless account key after the deploy key, so revoking the deploy key would not
+    have stopped the tool (audit F-03). With no config file read, the deploy key is the
+    only identity. The push URL therefore has to carry the user and port itself.
+    ``StrictHostKeyChecking=yes`` still reads the default ``~/.ssh/known_hosts``.
     ``BatchMode=yes`` so a prompt is a fast failure rather than a hung daemon.
     """
     # Quoted because git runs GIT_SSH_COMMAND through a shell. The path is deployment
     # config, never a caller parameter, so this is not an injection fix — it just removes
     # the standing assumption that the configured path contains no whitespace.
     return (
-        f"ssh -i {shlex.quote(str(deploy_key))} -o IdentitiesOnly=yes "
+        f"ssh -F /dev/null -i {shlex.quote(str(deploy_key))} -o IdentitiesOnly=yes "
         "-o BatchMode=yes -o StrictHostKeyChecking=yes"
     )
 
@@ -182,11 +188,8 @@ def _ssh_command(deploy_key: Path) -> str:
 #: (SC-06): this process is a long-lived daemon whose environment accumulates whatever the
 #: deployment puts there, and git spawns ssh, which reads it.
 #:
-#: SSH_AUTH_SOCK is deliberately absent. ``IdentitiesOnly=yes`` already stops ssh offering
-#: unrelated agent identities, but withholding the socket entirely means the deploy key is
-#: the only credential that *can* be used — guard 2 then holds structurally rather than by
-#: correct option handling. Same reasoning for any ambient forge token: git has no use for
-#: one over ssh, so it does not get one.
+#: SSH_AUTH_SOCK is deliberately absent, so the deploy key is the only credential that
+#: *can* be used. Same reasoning for any ambient forge token.
 _GIT_ENV_ALLOWLIST = ("HOME", "PATH", "LANG", "LC_ALL", "TZ", "GIT_CONFIG_GLOBAL")
 
 
@@ -200,18 +203,112 @@ def _git_env(deploy_key: Path | None) -> dict[str, str]:
 def _git(
     repo: Path, args: list[str], deploy_key: Path | None = None
 ) -> subprocess.CompletedProcess:
-    """Run git with a fixed argv and a minimal environment. Never a shell."""
-    return subprocess.run(
+    """Run git with a fixed argv and a minimal environment. Never a shell.
+
+    In its own process group, killed as a group on timeout: ``subprocess.run(timeout=)``
+    kills ``git`` but not its ``ssh`` child, so a timed-out push could still complete after
+    the caller had decided it had not (audit F-07).
+    """
+    with subprocess.Popen(
         ["git", "-C", str(repo), *args],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=_GIT_TIMEOUT_S,
         env=_git_env(deploy_key),
-    )
+        start_new_session=True,
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=_GIT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def _rev(repo: Path, ref: str) -> str | None:
+    r = _git(repo, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _read_yaml_at(repo: Path, ref: str, path: str) -> dict | None:
+    """Parse ``<ref>:<path>`` as YAML. None if it cannot be read or parsed."""
+    shown = _git(repo, ["show", f"{ref}:{path}"])
+    if shown.returncode != 0:
+        return None
+    try:
+        loaded = yaml.safe_load(shown.stdout)
+    except yaml.YAMLError:
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 # ---------------------------------------------------------------------------
-# Guards 3 + 4 — what is actually in the push range
+# Step 1 — precondition
+# ---------------------------------------------------------------------------
+
+
+def precondition(t: GitTarget) -> str | None:
+    """Return a refusal reason, or None if the checkout is fit to take this call's commit.
+
+    Runs before the config file is written. Fail-closed: a check that cannot be evaluated
+    is a refusal.
+    """
+    try:
+        status = _git(t.repo, ["status", "--porcelain", "--", t.rel])
+        if status.returncode != 0:
+            log.error("precondition_status_failed", stderr=status.stderr.strip())
+            return f"cannot read git status of {t.rel}"
+        if status.stdout.strip():
+            return (
+                f"{t.rel} has uncommitted changes in the checkout; they must be committed or "
+                "discarded (sysadmin) before this tool can change it"
+            )
+        if not t.push:
+            return None
+
+        if t.deploy_key is None or not t.deploy_key.exists():
+            log.error("precondition_no_deploy_key", path=str(t.deploy_key))
+            return "deploy key not found (path in the server log)"
+        head_ref = _git(t.repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+        if head_ref.returncode != 0 or head_ref.stdout.strip() != t.branch:
+            on = head_ref.stdout.strip() or "a detached HEAD"
+            return f"the checkout is on {on}, not {t.branch}; sysadmin must check out {t.branch}"
+        fetch = _git(t.repo, ["fetch", "--quiet", t.remote, t.branch], deploy_key=t.deploy_key)
+        if fetch.returncode != 0:
+            log.error("precondition_fetch_failed", stderr=fetch.stderr.strip())
+            return f"cannot fetch {t.remote}/{t.branch} to check the checkout is level with it"
+        counts = _git(
+            t.repo, ["rev-list", "--left-right", "--count", f"{t.remote}/{t.branch}...HEAD"]
+        )
+        if counts.returncode != 0:
+            log.error("precondition_revlist_failed", stderr=counts.stderr.strip())
+            return f"cannot compare {t.branch} with {t.remote}/{t.branch}"
+        behind, ahead = (int(x) for x in counts.stdout.split())
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        log.error("precondition_error", error=str(exc))
+        return "could not evaluate the git precondition"
+
+    if behind or ahead:
+        parts = []
+        if behind:
+            parts.append(f"{behind} behind")
+        if ahead:
+            parts.append(f"{ahead} ahead of")
+        where = " and ".join(parts)
+        if not ahead:
+            where += " of"
+        return (
+            f"local {t.branch} is {where} {t.remote}/{t.branch}; sysadmin must reconcile "
+            f"{t.repo.name} (pull, or push/drop the unpushed commits) before this tool can "
+            "commit to it"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Guards on the push range
 # ---------------------------------------------------------------------------
 
 
@@ -222,20 +319,12 @@ def inspect_push_range(
     branch: str,
     allowed_path: str,
     identity_email: str,
-    deploy_key: Path,
-) -> tuple[list[str], list[str]]:
-    """Return ``(commits, notes)`` for the range about to be pushed, or raise `PushRefused`.
+    deploy_key: Path | None,
+) -> list[str]:
+    """Return the commits about to be pushed, newest first, or raise `PushRefused`.
 
-    ``commits`` is newest-first, so ``commits[0]`` is the tip that was validated — the
-    caller must push *that SHA*, not ``HEAD``. See :func:`push_config_commit`.
-
-    ``notes`` records any guard that was skipped rather than passed, so a check that did
-    not run cannot be mistaken for a check that succeeded.
-
-    Fetches first. Without that, ``<remote>/<branch>`` is whatever this checkout last saw,
-    so the range would be computed against a stale remote and could either miss commits
-    somebody else pushed or re-examine commits already upstream. A guard evaluated against
-    a stale view is not a guard.
+    ``commits[0]`` is the tip that was validated — the caller must push *that SHA*, not
+    ``HEAD``. Fetches first, so the range is computed against the remote as it is now.
     """
     fetch = _git(repo, ["fetch", "--quiet", remote, branch], deploy_key=deploy_key)
     if fetch.returncode != 0:
@@ -244,7 +333,7 @@ def inspect_push_range(
 
     rng = f"{remote}/{branch}..HEAD"
 
-    # Guard 3 — author of every commit in the range.
+    # No foreign commits: every commit in the range is the tool's.
     authors = _git(repo, ["log", "--format=%H %ae", rng])
     if authors.returncode != 0:
         log.error("push_log_failed", stderr=authors.stderr.strip())
@@ -268,7 +357,7 @@ def inspect_push_range(
             + ", ".join(foreign[:5])
         )
 
-    # Guard 4 — paths touched by the range.
+    # Path-only: the range touches the config file and nothing else.
     names = _git(repo, ["diff", "--name-only", rng])
     if names.returncode != 0:
         log.error("push_diff_failed", stderr=names.stderr.strip())
@@ -281,62 +370,27 @@ def inspect_push_range(
             f"push range touches {len(disallowed)} path(s) outside {allowed_path!r}: "
             + ", ".join(sorted(disallowed)[:5])
         )
-
-    # Guard 5 — compare what is on the remote against what would land.
-    refusal, note = _check_additive_in_range(
-        repo, allowed_path=allowed_path, remote=remote, branch=branch
-    )
-    if refusal:
-        raise PushRefused(refusal)
-
-    return commits, ([note] if note else [])
-
-
-def _read_yaml_at(repo: Path, ref: str, path: str) -> dict | None:
-    """Parse ``<ref>:<path>`` as YAML. None if it cannot be read or parsed."""
-    shown = _git(repo, ["show", f"{ref}:{path}"])
-    if shown.returncode != 0:
-        return None
-    try:
-        loaded = yaml.safe_load(shown.stdout)
-    except yaml.YAMLError:
-        return None
-    return loaded if isinstance(loaded, dict) else None
-
-
-def _check_additive_in_range(
-    repo: Path, *, allowed_path: str, remote: str, branch: str
-) -> tuple[str | None, str | None]:
-    """Guard 5. Returns ``(refusal_reason, skip_note)`` — at most one is non-None."""
-    after = _read_yaml_at(repo, "HEAD", allowed_path)
-    if after is None:
-        return f"cannot parse {allowed_path} at HEAD to check the change is additive", None
-
-    before = _read_yaml_at(repo, f"{remote}/{branch}", allowed_path)
-    if before is None:
-        # The file does not exist upstream yet (or is unparseable there). Creating it is
-        # additive by definition, and an unparseable upstream cannot be distinguished from
-        # a missing one from here — so this is a skip, not a pass. It is reported as one:
-        # a guard that did not run must not look identical to a guard that succeeded, which
-        # is the whole complaint behind this build's other three tickets.
-        return None, (f"additive check skipped — no parseable {allowed_path} on {remote}/{branch}")
-
-    return validate_additive(before, after), None
+    return commits
 
 
 # ---------------------------------------------------------------------------
-# Guard 6 — audit trail outside git
+# Audit trail outside git
 # ---------------------------------------------------------------------------
 
 
-def emit_audit_event(audit_dir: Path | None, summary: str, metadata: dict) -> str | None:
+def emit_audit_event(
+    audit_dir: Path | None,
+    summary: str,
+    metadata: dict,
+    *,
+    event: str = "artifact.untracked",
+) -> str | None:
     """Append one agent-bus-shaped event. Returns an error string, or None on success.
 
-    Deliberately not fatal. The push is already fully guarded by the time this runs, and
-    refusing a validated push because a log file is unwritable would trade a real
-    capability for a bookkeeping failure. The caller surfaces the error in its result
-    rather than dropping it — an audit sink that fails silently is the same defect class
-    this whole change is about.
+    Deliberately not fatal: refusing a validated change because a log file is unwritable
+    would trade a real capability for a bookkeeping failure. But a failure is never silent
+    either — the caller surfaces it in its result, it is logged at ERROR, and it increments
+    ``doc_cache_audit_sink_errors_total`` so an alert can see it (vikunja#380).
 
     No-op when unconfigured, so the public package has no forge-specific behaviour by
     default and CI needs no fixture.
@@ -347,10 +401,10 @@ def emit_audit_event(audit_dir: Path | None, summary: str, metadata: dict) -> st
         audit_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(UTC)
         path = audit_dir / f"{now.strftime('%Y-%m-%d')}-cross-agent.jsonl"
-        event = {
+        record = {
             "id": str(uuid.uuid4()),
             "ts": now.isoformat(),
-            "event": "artifact.untracked",
+            "event": event,
             "scope": "cross-agent",
             "source": "doc-cache-mcp",
             "target": None,
@@ -360,243 +414,261 @@ def emit_audit_event(audit_dir: Path | None, summary: str, metadata: dict) -> st
             "metadata": metadata,
         }
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event) + "\n")
+            fh.write(json.dumps(record) + "\n")
         return None
     except OSError as exc:
-        log.error("push_audit_write_failed", error=str(exc))
+        log.error("audit_sink_write_failed", error=str(exc), audit_event=event)
+        emit_metric("doc_cache_audit_sink_errors_total", {"event": event}, {"count": 1})
         return f"audit event not written: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Steps 2-5 — write, commit, classify, guard, push, roll back
 # ---------------------------------------------------------------------------
 
 
-def _pr_url(remote_url: str, branch: str, target: str) -> str | None:
-    """Best-effort web URL for opening a PR from *branch*. None if the remote is unusual.
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)  # atomic within the same directory
 
-    Handles the three forms in use on forge: ``ssh://git@host:2222/org/repo.git``, the
-    scp-like ``git@host:org/repo.git``, and plain https. Returning None is fine — the
-    caller still reports the review branch, which is the part that matters.
+
+def _restore_file(t: GitTarget, ref: str) -> bool:
+    r = _git(t.repo, ["restore", f"--source={ref}", "--staged", "--worktree", "--", t.rel])
+    if r.returncode != 0:
+        log.error("restore_failed", stderr=r.stderr.strip())
+    return r.returncode == 0
+
+
+def _rollback(t: GitTarget, pre: str, sha: str) -> str | None:
+    """Undo this call's commit. Returns None on success, or why it was not safe to.
+
+    Never discards anyone else's work: the ref moves only by compare-and-swap from exactly
+    ``sha`` to exactly ``pre``, and the file is restored only if it still holds what this
+    call committed. ``sha`` is re-checked as the tool's own commit first.
     """
-    url = remote_url.strip()
-    for scheme in ("ssh://", "https://", "http://", "git://"):
-        if url.startswith(scheme):
-            url = url[len(scheme) :]
-            break
-    if "@" in url:
-        url = url.split("@", 1)[1]
+    try:
+        author = _git(t.repo, ["log", "-1", "--format=%ae", sha])
+        if author.returncode != 0 or author.stdout.strip() != t.identity_email:
+            return f"commit {sha[:8]} is not this tool's; not rolled back"
+        if _rev(t.repo, f"{sha}^") != pre:
+            return f"commit {sha[:8]} is not on top of {pre[:8]}; not rolled back"
+        swap = _git(
+            t.repo,
+            ["update-ref", "-m", f"doc-cache-mcp: roll back {sha[:8]}", "HEAD", pre, sha],
+        )
+        if swap.returncode != 0:
+            log.error("rollback_cas_failed", stderr=swap.stderr.strip())
+            return (
+                f"HEAD moved past {sha[:8]} (a concurrent commit); not rolled back, so "
+                f"{sha[:8]} is an unpushed commit on local {t.branch}"
+            )
+        # Worktree AND index: `restore --staged --worktree` would overwrite a staged-only
+        # edit too, which the worktree diff alone does not see (audit F-10).
+        edited = _git(t.repo, ["diff", "--quiet", sha, "--", t.rel])
+        staged = _git(t.repo, ["diff", "--quiet", "--cached", sha, "--", t.rel])
+        if edited.returncode != 0 or staged.returncode != 0:
+            return (
+                f"ref rolled back to {pre[:8]}, but {t.rel} was edited after this call wrote "
+                "it, so the file was left as it is"
+            )
+        if not _restore_file(t, pre):
+            return f"ref rolled back to {pre[:8]}, but {t.rel} could not be restored"
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.error("rollback_error", error=str(exc))
+        return "rollback did not complete (git did not run to completion)"
+    return None
 
-    # scp-like or explicit port: host:something → host/something, dropping a numeric port.
-    if ":" in url.split("/", 1)[0]:
-        host_part, _, rest = url.partition(":")
-        head, _, tail = rest.partition("/")
-        rest = tail if head.isdigit() and tail else rest
-        url = f"{host_part}/{rest}"
 
-    host, _, path = url.partition("/")
-    path = path.removesuffix(".git").strip("/")
-    if not host or "/" not in path:
+def _undo(t: GitTarget, pre: str, sha: str, reason: str, base: dict) -> dict:
+    problem = _rollback(t, pre, sha)
+    if problem is None:
+        return {**base, "outcome": ROLLED_BACK, "sha": None, "reason": reason}
+    return {**base, "outcome": STRANDED, "sha": sha, "reason": f"{reason}; {problem}"}
+
+
+def _remote_has(t: GitTarget, sha: str) -> bool | None:
+    """After an ambiguous push: did ``sha`` land? None if that cannot be determined."""
+    try:
+        fetch = _git(t.repo, ["fetch", "--quiet", t.remote, t.branch], deploy_key=t.deploy_key)
+        if fetch.returncode != 0:
+            return None
+        # Ancestry, not equality: someone else's commit landing on top before this fetch
+        # would otherwise read as "did not land" and roll back a landed push (audit R2-05).
+        r = _git(t.repo, ["merge-base", "--is-ancestor", sha, f"{t.remote}/{t.branch}"])
+        if r.returncode in (0, 1):
+            return r.returncode == 0
         return None
-    return f"https://{host}/{path}/compare/{target}...{branch}"
+    except (subprocess.SubprocessError, OSError):
+        return None
 
 
-def push_config_commit(
-    repo: Path,
+def commit_change(
+    t: GitTarget,
     *,
-    allowed_path: str,
-    remote: str,
-    branch: str,
-    identity_email: str,
-    deploy_key: Path,
-    review_branch_prefix: str,
-    audit_dir: Path | None,
+    new_text: str,
+    message: str,
+    expected: str,
     service: str,
     calling_agent: str | None = None,
 ) -> dict:
-    """Push the pending config commit, or degrade to a review branch.
+    """Write ``new_text`` to the config, commit it, and push it — or undo it.
 
-    **Does not raise.** Every git call is wrapped. This matters beyond tidiness: the caller
-    has already committed successfully by the time this runs, and an exception escaping
-    here is caught upstream by ``doc_cache_add_service``'s broad handler, which discards
-    the already-true ``committed: True`` and reports ``committed: False`` — telling the
-    operator nothing happened when a commit is sitting on disk. That is the same
-    reported-state-versus-real-state defect the rest of this build exists to fix, so the
-    property is asserted by a test rather than by this sentence (an earlier version of this
-    docstring claimed it while the push call was unwrapped).
+    The caller has already run :func:`precondition` under the same lock. ``expected`` is the
+    one kind of change (see :func:`classify_change`) the calling tool performs; anything
+    else is rolled back. **Does not raise**: every git call is wrapped, because the result
+    must describe what is actually on disk.
 
-    Returns the ``commit`` sub-dict fields describing what happened — always including
-    ``pushed``; ``pushed_sha`` on success; on degradation a ``reason`` plus the review
-    branch and PR URL; ``notes`` for any guard that was skipped rather than passed.
+    Returns ``{"outcome", "sha", "change", "reason"}`` plus ``audit_error`` if the audit
+    sink failed.
     """
-    if not _SAFE_SERVICE.match(service or ""):
-        return {"pushed": False, "reason": f"invalid service name {service!r}"}
-
-    if not deploy_key.exists():
+    path = t.repo / t.rel
+    base: dict[str, Any] = {"change": None}
+    try:
+        pre = _rev(t.repo, "HEAD")
+        if pre is None:
+            return {**base, "outcome": REFUSED, "sha": None, "reason": "cannot resolve HEAD"}
+        _atomic_write(path, new_text)
+        ident = identity_args(t.identity_name, t.identity_email)
+        add = _git(t.repo, ["add", "--", t.rel])
+        commit = (
+            _git(t.repo, [*ident, "commit", "-m", message, "--", t.rel])
+            if add.returncode == 0
+            else add
+        )
+        if commit.returncode != 0:
+            out = (commit.stdout + commit.stderr).lower()
+            if "nothing to commit" in out or "no changes added" in out:
+                return {**base, "outcome": UNCHANGED, "sha": None, "reason": None}
+            log.error("git_commit_failed", stderr=commit.stderr.strip())
+            restored = _restore_file(t, "HEAD")
+            return {
+                **base,
+                "outcome": ROLLED_BACK if restored else STRANDED,
+                "sha": None,
+                "reason": "git commit failed"
+                + ("" if restored else f"; {t.rel} could not be restored"),
+            }
+        sha = _rev(t.repo, "HEAD")
+        if sha is None:
+            return {
+                **base,
+                "outcome": STRANDED,
+                "sha": None,
+                "reason": "commit made, HEAD unreadable",
+            }
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.error("commit_error", error=str(exc))
         return {
-            "pushed": False,
-            "reason": f"deploy key not found at {deploy_key}",
+            **base,
+            "outcome": STRANDED,
+            "sha": None,
+            "reason": "git did not run to completion",
         }
 
     try:
-        commits, notes = inspect_push_range(
-            repo,
-            remote=remote,
-            branch=branch,
-            allowed_path=allowed_path,
-            identity_email=identity_email,
-            deploy_key=deploy_key,
+        change = classify_change(
+            _read_yaml_at(t.repo, pre, t.rel), _read_yaml_at(t.repo, sha, t.rel)
+        )
+    except (subprocess.SubprocessError, OSError):
+        change = "unknown"
+    base["change"] = change
+
+    def done(result: dict) -> dict:
+        return _audited(t, result, service, calling_agent)
+
+    if change != expected:
+        reason = f"change classified as {change!r}, but this tool only makes {expected!r}"
+        return done(_undo(t, pre, sha, reason, base))
+
+    if not t.push:
+        return done(
+            {
+                **base,
+                "outcome": COMMITTED_LOCAL,
+                "sha": sha,
+                "reason": "push disabled (git_push=false)",
+            }
+        )
+
+    try:
+        commits = inspect_push_range(
+            t.repo,
+            remote=t.remote,
+            branch=t.branch,
+            allowed_path=t.rel,
+            identity_email=t.identity_email,
+            deploy_key=t.deploy_key,
         )
     except PushRefused as refusal:
-        return _degrade(
-            repo,
-            reason=refusal.reason,
-            remote=remote,
-            branch=branch,
-            deploy_key=deploy_key,
-            review_branch_prefix=review_branch_prefix,
-            audit_dir=audit_dir,
-            service=service,
-            calling_agent=calling_agent,
-        )
+        return done(_undo(t, pre, sha, refusal.reason, base))
     except (subprocess.SubprocessError, OSError) as exc:
         log.error("push_guard_error", error=str(exc))
-        return {"pushed": False, "reason": "could not evaluate push guards"}
+        return done(_undo(t, pre, sha, "could not evaluate push guards", base))
 
-    # Push the SHA the guards actually inspected, NOT the `HEAD` ref.
-    #
-    # `HEAD` is a moving target: it is resolved again by git at push time, several
-    # subprocess calls after inspect_push_range() read it. Anything that commits into this
-    # checkout in that window — a concurrent add_service call over streamable-http, a human
-    # working in host-forge-scripts, another automation — would ride along having passed
-    # none of guards 3, 4 or 5. That is exactly the failure guard 3 exists to prevent,
-    # reintroduced as a race rather than as a missing check. Pinning the tip closes the
-    # window without needing a lock: a commit arriving late simply is not in the push.
     tip = commits[0]
+    failure = "push to the target branch was rejected"
     try:
-        result = _git(repo, ["push", remote, f"{tip}:refs/heads/{branch}"], deploy_key=deploy_key)
-    except (subprocess.SubprocessError, OSError) as exc:
-        # Notably includes TimeoutExpired, where the push may well have landed server-side.
-        # Report the ambiguity rather than asserting failure — and never raise, because the
-        # caller has already committed successfully and an exception escaping here gets
-        # relabelled upstream as "the commit failed", which is a lie about work that is on
-        # disk.
-        log.error("push_subprocess_error", error=str(exc))
-        return {
-            "pushed": False,
-            "reason": (
-                "push outcome unknown: git did not run to completion, so the commit may or "
-                "may not have reached the remote — check the branch before retrying"
-            ),
-        }
-
-    if result.returncode != 0:
-        log.error("push_failed", stderr=result.stderr.strip())
-        return _degrade(
-            repo,
-            reason="push to the target branch was rejected",
-            remote=remote,
-            branch=branch,
-            deploy_key=deploy_key,
-            review_branch_prefix=review_branch_prefix,
-            audit_dir=audit_dir,
-            service=service,
-            calling_agent=calling_agent,
-        )
-
-    out: dict[str, Any] = {
-        "pushed": True,
-        "identity": identity_email,
-        "commits": len(commits),
-        "pushed_sha": tip,
-    }
-    if notes:
-        out["notes"] = notes
-    audit_err = emit_audit_event(
-        audit_dir,
-        f"doc-cache-mcp pushed {len(commits)} commit(s) for service {service!r} "
-        f"to {remote}/{branch}",
-        {
-            "service": service,
-            "commits": commits,
-            "pushed_sha": tip,
-            "branch": branch,
-            "calling_agent": calling_agent,
-            "path": allowed_path,
-            "notes": notes,
-        },
-    )
-    if audit_err:
-        out["audit_error"] = audit_err
-    return out
-
-
-def _degrade(
-    repo: Path,
-    *,
-    reason: str,
-    remote: str,
-    branch: str,
-    deploy_key: Path,
-    review_branch_prefix: str,
-    audit_dir: Path | None,
-    service: str,
-    calling_agent: str | None,
-) -> dict:
-    """A guard tripped: put the work somewhere a human can review it, and say why."""
-    if reason == "nothing to push":
-        # Not a failure — the commit step found no changes. Say so plainly rather than
-        # manufacturing a review branch for an empty diff.
-        return {"pushed": False, "reason": reason}
-
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    review_branch = f"{review_branch_prefix}/{service}-{stamp}"
-
-    out: dict[str, Any] = {"pushed": False, "reason": reason}
-
-    try:
-        # Resolve once and push that SHA, for the same reason the success path does: the
-        # branch a human is asked to review must be the state that was actually assessed,
-        # not whatever HEAD drifted to afterwards.
-        head_rev = _git(repo, ["rev-parse", "HEAD"])
-        tip = head_rev.stdout.strip() if head_rev.returncode == 0 else "HEAD"
         pushed = _git(
-            repo,
-            ["push", remote, f"{tip}:refs/heads/{review_branch}"],
-            deploy_key=deploy_key,
+            t.repo, ["push", t.remote, f"{tip}:refs/heads/{t.branch}"], deploy_key=t.deploy_key
         )
-        remote_url = _git(repo, ["remote", "get-url", remote]) if pushed.returncode == 0 else None
+        ok = pushed.returncode == 0
+        if not ok:
+            # A non-zero exit does not prove the ref did not move: the connection can drop
+            # after the remote updated it. Ask, rather than roll back a landed push (F-07).
+            log.error("push_failed", stderr=pushed.stderr.strip())
+            landed = _remote_has(t, tip)
+            if landed is None:
+                return done(
+                    {
+                        **base,
+                        "outcome": STRANDED,
+                        "sha": sha,
+                        "reason": "push was rejected and the remote could not be checked; "
+                        f"{sha[:8]} may or may not be on {t.remote}/{t.branch}",
+                    }
+                )
+            ok = landed
     except (subprocess.SubprocessError, OSError) as exc:
-        log.error("push_review_branch_error", error=str(exc))
-        out["review_branch_error"] = "could not push a review branch (git did not complete)"
-        pushed = None
-        remote_url = None
-        tip = None
+        # Notably TimeoutExpired, where the push may have landed. Ask the remote.
+        log.error("push_subprocess_error", error=str(exc))
+        landed = _remote_has(t, tip)
+        if landed is None:
+            return done(
+                {
+                    **base,
+                    "outcome": STRANDED,
+                    "sha": sha,
+                    "reason": "push did not complete and the remote could not be checked; "
+                    f"{sha[:8]} may or may not be on {t.remote}/{t.branch}",
+                }
+            )
+        ok = landed
+        failure = "push did not complete and the commit is not on the remote"
 
-    if pushed is not None and pushed.returncode == 0:
-        out["review_branch"] = review_branch
-        out["review_sha"] = tip
-        if remote_url is not None and remote_url.returncode == 0:
-            url = _pr_url(remote_url.stdout, review_branch, branch)
-            if url:
-                out["pr_url"] = url
-    elif pushed is not None:
-        # Both paths failed. Do not dress this up — the commit is stranded locally, which
-        # is exactly the state vikunja#363 is about.
-        log.error("push_review_branch_failed", stderr=pushed.stderr.strip())
-        out["review_branch_error"] = "could not push a review branch either"
+    if not ok:
+        return done(_undo(t, pre, sha, failure, base))
+    return done({**base, "outcome": PUSHED, "sha": tip, "reason": None})
 
-    audit_err = emit_audit_event(
-        audit_dir,
-        f"doc-cache-mcp REFUSED to push for service {service!r}: {reason}",
+
+def _audited(t: GitTarget, result: dict, service: str, calling_agent: str | None) -> dict:
+    """Record the decision outside git, so the trail survives a force-push."""
+    outcome = result["outcome"]
+    err = emit_audit_event(
+        t.audit_dir,
+        f"doc-cache-mcp {outcome} a {result.get('change')} change for service {service!r}"
+        + (f": {result['reason']}" if result.get("reason") else ""),
         {
             "service": service,
-            "reason": reason,
-            "head": tip,
-            "review_branch": out.get("review_branch"),
+            "outcome": outcome,
+            "change": result.get("change"),
+            "sha": result.get("sha"),
+            "reason": result.get("reason"),
+            "branch": t.branch,
+            "path": t.rel,
             "calling_agent": calling_agent,
         },
     )
-    if audit_err:
-        out["audit_error"] = audit_err
-    return out
+    if err:
+        result["audit_error"] = err
+    return result

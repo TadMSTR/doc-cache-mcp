@@ -3,7 +3,8 @@
 ``doc-sync.py`` lives outside any package (in ``host-forge-scripts/scripts``, reached via the
 ``~/scripts`` symlink) and its name contains a hyphen, so it cannot be imported normally. We
 load it by path and cache the module. The MCP calls its ``sync_service`` / ``load_config`` /
-``load_state`` rather than re-implementing chunking or shelling out to the script.
+``load_state`` / ``remove_topics`` rather than re-implementing chunking or shelling out to the
+script.
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ def load_doc_sync() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules["forge_doc_sync"] = module
     spec.loader.exec_module(module)
+    # One provisional cache location, not two that can disagree (see config.py).
+    if hasattr(module, "PROVISIONAL_CACHE_DIR"):
+        module.PROVISIONAL_CACHE_DIR = Path(get_settings().provisional_cache_dir).expanduser()
     _module = module
     return module
 
