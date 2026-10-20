@@ -61,7 +61,8 @@ Every URL is classified by [`allowlist.py`](src/doc_cache_mcp/allowlist.py) — 
 by this server, and at fetch time, per redirect hop, by `doc-sync.py`, which imports a
 generated copy of the same module. Evaluation order; **deny wins**:
 
-1. **Structural.** `https` only; a host *name* (IP literals refused); no userinfo; port 443
+1. **Structural.** `https` only; a host *name* (IP literals refused, including the numeric
+   IPv4 forms `inet_aton` accepts: `16843009`, `0x01010101`, `1.1`); no userinfo; port 443
    or none.
 2. **Deny**, absolute, every tier:
    - *Open-edit sources* — public wikis anyone can edit (GitHub/GitLab wikis, `wiki.atom`
@@ -235,7 +236,7 @@ with `pip install ".[telemetry]"`.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP span export (e.g. `http://127.0.0.1:4317`). `service.name` is `doc-cache-mcp`. |
 | `INFLUXDB_URL` | Best-effort per-call metric emission to InfluxDB 3. |
 | `INFLUXDB_TOKEN` | Auth token for the InfluxDB backend. |
-| `INFLUXDB_BUCKET` | Target database/bucket (default `doc-cache-mcp`). |
+| `INFLUXDB_DATABASE` | Target database. Falls back to `INFLUXDB_BUCKET`, then `doc-cache-mcp`. On forge PM2 sets `forge`, the database Grafana reads. |
 
 ### Failure behaviour
 

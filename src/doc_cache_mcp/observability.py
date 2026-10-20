@@ -91,7 +91,14 @@ def _get_influx():
         _influx = InfluxDBClient3(
             host=url,
             token=os.environ.get("INFLUXDB_TOKEN", ""),
-            database=os.environ.get("INFLUXDB_BUCKET", "doc-cache-mcp"),
+            # INFLUXDB_DATABASE is what PM2 sets (forge, the database Grafana reads);
+            # reading only INFLUXDB_BUCKET sent every point to an unread `doc-cache-mcp`
+            # database and blinded DocCacheAuditSinkErrors (vikunja#1172).
+            database=(
+                os.environ.get("INFLUXDB_DATABASE")
+                or os.environ.get("INFLUXDB_BUCKET")
+                or "doc-cache-mcp"
+            ),
         )
     except Exception as exc:
         _influx_failed = True

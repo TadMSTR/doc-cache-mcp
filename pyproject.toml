@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "doc-cache-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Capability-scoped FastMCP server for the forge documentation cache (list/add/sync + source-URL allowlist)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -31,6 +31,14 @@ dependencies = [
     # streamed read reaches from hosts nobody approved (audit F-01).
     "urllib3>=2.8.0",
     "html2text>=2024.2.26",
+    # Floors only — venv-deploy keeps an installed dependency that still satisfies its
+    # spec, so a CVE fix reaches the venv only when the floor moves (p2 audit F-06).
+    # mcp 1.30.0 fixes CVE-2026-59951 (GHSA-84m7-p3x7-pcfv, unreclaimed streamable-HTTP
+    # sessions); the transport now also runs stateless, see server.main().
+    "mcp>=1.30.0",
+    "pyjwt>=2.15.0",
+    "anyio>=4.14.2",
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]

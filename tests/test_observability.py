@@ -236,6 +236,32 @@ def test_get_influx_success_is_cached(monkeypatch, rec_log):
     assert rec_log.warnings == []
 
 
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        # What PM2 sets on forge — the case that sent every point to `doc-cache-mcp`.
+        ({"INFLUXDB_DATABASE": "forge"}, "forge"),
+        ({"INFLUXDB_DATABASE": "forge", "INFLUXDB_BUCKET": "other"}, "forge"),
+        ({"INFLUXDB_BUCKET": "other"}, "other"),
+        ({}, "doc-cache-mcp"),
+    ],
+)
+def test_get_influx_database_reads_influxdb_database_first(monkeypatch, env, expected):
+    """vikunja#1172 (comments 1501/1502)."""
+    calls = []
+    mod = _fake_influx_module()
+    mod.InfluxDBClient3 = lambda **kwargs: calls.append(kwargs) or object()
+    monkeypatch.setitem(sys.modules, "influxdb_client_3", mod)
+    monkeypatch.setenv("INFLUXDB_URL", "http://127.0.0.1:8182")
+    for var in ("INFLUXDB_DATABASE", "INFLUXDB_BUCKET"):
+        monkeypatch.delenv(var, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    observability._get_influx()
+    assert calls[0]["database"] == expected
+
+
 # ---------------------------------------------------------------------------
 # The write path — the half that must not be dropped (#580)
 # ---------------------------------------------------------------------------

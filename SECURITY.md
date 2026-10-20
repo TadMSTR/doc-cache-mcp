@@ -17,7 +17,8 @@ of the edit, not its *content*, so it had nowhere to enforce this.
 
 1. **Source-URL policy** (`allowlist.py`, `classify_url`) — enforced before any write and
    before every fetch hop. Deny wins:
-   - `https` only; host must be a name (IP literals refused); no userinfo; port 443 or none.
+   - `https` only; host must be a name (IP literals refused, numeric IPv4 forms such as
+     `16843009` / `0x01010101` / `1.1` included); no userinfo; port 443 or none.
    - **Open-edit floor** in code (GitHub/GitLab wikis, `wiki.atom`, `wiki.debian.org`),
      matched on the decoded, normalised path. The allowlist file can add to it, never
      remove from it. **Path shapes** restrict a host to named path patterns.

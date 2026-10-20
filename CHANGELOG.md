@@ -4,6 +4,33 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] — 2026-10-20
+
+Fixes from doc-cache-friction-2026-10 part 2 (vikunja#1172, audit F-04 and F-06). **Needs
+host-forge/scripts with the regenerated `doc_cache_allowlist.py`**, or doc-sync keeps
+admitting IP literals at fetch time.
+
+### Security
+- **IP-literal hosts are refused again.** The structural check raised `AllowlistError`
+  inside its own `except ValueError`, and AllowlistError subclasses ValueError, so the
+  refusal was swallowed: on 0.2.2 and 0.3.0 `https://1.2.3.4/x` classified `provisional`,
+  and an excluded host could be named by its address. Numeric IPv4 forms that
+  `ipaddress` rejects but `inet_aton` resolves (`16843009`, `0x01010101`, octal, `1.1`)
+  are refused too, by the WHATWG ends-in-a-number rule (F-04).
+- **Dependency floors** `mcp>=1.30.0` (CVE-2026-59951, GHSA-84m7-p3x7-pcfv: unreclaimed
+  streamable-HTTP sessions), `pyjwt>=2.15.0`, `anyio>=4.14.2`, `cryptography>=50.0.0`
+  (F-06). venv-deploy keeps installed dependencies that still satisfy their spec, so
+  only a floor moves the venv.
+- The HTTP transport runs **stateless** (`stateless_http=True`). No tool keeps session
+  state; `doc_cache_sync`'s progress heartbeat still arrives (probed on fastmcp 3.4.3 /
+  mcp 1.30.0 and fastmcp 4.1.1 / mcp 2.3.0).
+
+### Fixed
+- **Metrics go to the database PM2 names.** `_get_influx()` read only `INFLUXDB_BUCKET`,
+  while forge's PM2 env sets `INFLUXDB_DATABASE=forge`, so every point landed in an unread
+  `doc-cache-mcp` database and DocCacheAuditSinkErrors could never fire (#380). It now
+  reads `INFLUXDB_DATABASE`, then `INFLUXDB_BUCKET`, then `doc-cache-mcp`.
+
 ## [0.3.0] — 2026-10-19
 
 Every doc-cache call now finishes or fails, and says which. Topics can be repointed and

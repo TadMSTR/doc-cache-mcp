@@ -184,6 +184,39 @@ def test_unlisted_public_host_is_provisional(v2):
     assert v.host == "unvetted.example"
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "1.1.1.1",
+        "1.2.3.4",
+        "127.0.0.1",
+        # Numeric IPv4 forms ipaddress rejects but inet_aton (getaddrinfo) resolves (F-04).
+        "16843009",
+        "0x01010101",
+        "0X01010101",
+        "0177.0.0.1",
+        "1.1",
+        "docs.0x7f",  # WHATWG: the last label alone decides
+        "1.1.1.1.",  # trailing dot
+        "[::1]",
+        "[2606:4700:4700::1111]",
+        "[2606:4700::1]",
+        "[::ffff:127.0.0.1]",
+    ],
+)
+def test_ip_literal_hosts_are_refused_with_provisional_enabled(v2, host):
+    """vikunja#1172: the old refusal raised inside its own ``except ValueError`` and was
+    swallowed, so on 0.3.0 every one of these classified provisional. The resolver says
+    public, so only the structural step can refuse them."""
+    with pytest.raises(AllowlistError, match="not an IP literal"):
+        classify_url(f"https://{host}/x", v2, PUBLIC)
+
+
+@pytest.mark.parametrize("host", ["1password.com", "123.example.com", "docs.v1.example"])
+def test_names_with_digits_are_not_ip_literals(v2, host):
+    assert classify_url(f"https://{host}/x", v2, PUBLIC).trust == PROVISIONAL
+
+
 @pytest.mark.parametrize("url", ["https://pastebin.com/raw/x", "https://abc.ngrok-free.app/x"])
 def test_excluded_hosts_are_refused(v2, url):
     with pytest.raises(AllowlistError, match="provisional_exclude"):
