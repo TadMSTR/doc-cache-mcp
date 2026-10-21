@@ -28,13 +28,13 @@ validation as a first-class control.
 
 ## Tools
 
-| Tool | Behaviour |
-|------|-----------|
-| `doc_cache_list_services(service=None, detail=False)` | Read-only. By default a compact **health summary**: per service its topic count, chunk total and worst status, plus `health` (topic counts by status) and `failing` (each failing topic with its last error). `service=` or `detail=true` gives per-topic rows: `status`, `last_success`, `last_error`, `consecutive_failures`, `trust`. |
-| `doc_cache_add_service(service, entries)` | Registers **new** topics `[{topic, url}]`. Strictly additive: an existing topic with the same URL is `unchanged`; one with a different URL is refused with a pointer to `update_topic`. Warns when a URL is already registered under another topic. Never fetches. |
-| `doc_cache_update_topic(service, topic, url)` | Repoints one existing topic. Same URL checks as add. |
-| `doc_cache_remove_topic(service, topics, remove_service=False)` | Removes topics (at most 20 per call), then their cached chunks in both tiers, their sync state, and their metadata-index rows. Emptying a service needs `remove_service=true`. |
-| `doc_cache_sync(service, dry_run=False)` | Ingests/refreshes a configured service: fetch → convert → chunk → cache. Each result carries `status` (`ok` / `failing` / `expired_provisional`), `trust`, and on failure the real `error`. The docs become searchable in qmd after the next hourly `qmd-refresh` (at :00). |
+| Tool | Description | Key parameters | Returns |
+|------|-------------|----------------|---------|
+| `doc_cache_list_services` | Read-only. By default a compact **health summary** of the cache. Call it before add/update/remove/sync. | `service` (optional; implies per-topic detail), `detail` (default `false`) | Summary: `services` (per service its topic count, chunk total and worst status), `health` (topic counts by status), `failing` (each failing topic with its last error). Detail: per-topic rows with `topic`, `url`, `status`, `chunks`, `last_success`, `last_error`, `consecutive_failures`, `trust`. |
+| `doc_cache_add_service` | Registers **new** topics, creating the service if needed. Strictly additive: an existing topic with the same URL is `unchanged`; one with a different URL is refused with a pointer to `doc_cache_update_topic`. All-or-nothing: one bad entry refuses the call. Never fetches. | `service` (`^[A-Za-z0-9_-]+$`), `entries` (list of `{topic, url}`, at most `MAX_ENTRIES_PER_ADD`; `topic` is `^[A-Za-z0-9._-]+$`) | `outcome`, `sha`, `change`, `reason`, plus `added`, `provisional` and any `warnings` (e.g. the URL is already registered under another topic). |
+| `doc_cache_update_topic` | Repoints one existing topic. The new URL is classified exactly as add classifies one. The topic keeps its name and position; a provisional topic keeps its original `added` date, so a repoint does not restart its TTL. | `service`, `topic`, `url` | `outcome`, `sha`, `change`, `reason`, `previous_url`. |
+| `doc_cache_remove_topic` | Removes topics, then (only if the config change lands) their cached chunks in both tiers, their sync state and their metadata-index rows. All-or-nothing. Removing a service's last topic needs `remove_service=true`. If `cache.ok` is false, call again with the same topics to retry the cleanup. | `service`, `topics` (at most `MAX_REMOVE_PER_CALL`; empty only with `remove_service=true`), `remove_service` (default `false`) | `outcome`, `sha`, `change`, `reason`, plus `cache` (the cleanup half) and `orphans` on a retry. |
+| `doc_cache_sync` | Ingests/refreshes a configured service: fetch, convert, chunk, write to the cache. Sends a progress notification every 15 s while it runs. Indexes nothing: the docs become searchable in qmd after the next hourly `qmd-refresh` (at :00). | `service` (must already exist in `doc-sync.yml`), `dry_run` (default `false`) | `ok` (false if any source failed), `errors`, `results` (each with `status` `ok` / `failing` / `expired_provisional`, `trust`, and on failure the real `error`). A call that cannot run returns `outcome: refused` with a `reason`. |
 
 Topic statuses: `ok`; `stale` (last success over 3 days ago); `failing` (its last sync
 failed; `last_success` keeps the date of the last good one); `never_synced`;
@@ -131,13 +131,17 @@ provisional:                 # absent = disabled (v1 behaviour)
 provisional_exclude: [pastebin.com, .ngrok-free.app]   # never self-service
 ```
 
-The allowlist lives at `host-forge-scripts/doc-cache-allowlist.yml` (git-backed) and is
-re-read on every call, so edits take effect without a restart.
+The allowlist is a git-backed YAML file (`DOC_CACHE_MCP_ALLOWLIST_PATH`), re-read on every
+call, so edits take effect without a restart. `doc-sync.py` enforces the same policy at fetch
+time through `doc_cache_allowlist.py`, a copy of `allowlist.py` generated next to it with
+`python -m doc_cache_mcp.vendoring --write`. Regenerate it after any change to
+`allowlist.py`, and commit it wherever `doc-sync.py` lives. Upgrading to 0.3.1 without
+regenerating it leaves fetch time admitting IP-literal hosts.
 
 ## Architecture
 
 `doc-cache-mcp` does **not** re-implement chunking or shell out. It imports the shared
-[`doc-sync.py`](https://gitea.tadmstr.me) logic (`sync_service()`) as the single source of
+`doc-sync.py` logic (`sync_service()`, `remove_topics()`) by path as the single source of
 truth for fetch/convert/chunk/write, and calls it directly. The CLI (`doc-sync.py --service …`,
 the `doc-sync-daily` cron) and the MCP share the same core and the same `flock` on the
 state file, so they never race writes.
@@ -149,25 +153,30 @@ loopback-only.
 
 ## Configuration
 
-Environment variables (prefix `DOC_CACHE_MCP_`):
+Environment variables (prefix `DOC_CACHE_MCP_`). A `.env` file in the working directory is
+also read. None is strictly required, but the path defaults assume the layout below; set
+them to match yours.
 
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `DOC_CACHE_MCP_TRANSPORT` | `http` | `http` (streamable-http) or `stdio`. |
-| `DOC_CACHE_MCP_HOST` | `127.0.0.1` | Bind host. Loopback only by design. |
-| `DOC_CACHE_MCP_PORT` | `8503` | Bind port. |
-| `DOC_CACHE_MCP_DOCSYNC_PATH` | `~/scripts/doc-sync.py` | Shared doc-sync logic to import. |
-| `DOC_CACHE_MCP_CONFIG_PATH` | `~/docs/doc-sync.yml` | Docs cache config the add-tool edits. |
-| `DOC_CACHE_MCP_ALLOWLIST_PATH` | `host-forge-scripts/doc-cache-allowlist.yml` | Source-URL allowlist. |
-| `DOC_CACHE_MCP_GIT_COMMIT` | `true` | Commit `doc-sync.yml` after each change. |
-| `DOC_CACHE_MCP_MAX_ENTRIES_PER_ADD` | `50` | Ceiling on source entries accepted in one `add_service` call. |
-| `DOC_CACHE_MCP_MAX_REMOVE_PER_CALL` | `20` | Ceiling on topics removed in one `remove_topic` call. |
-| `DOC_CACHE_MCP_PROVISIONAL_CACHE_DIR` | `~/.claude/docs-provisional` | Where provisional chunks go. `doc-sync.py` reads the same variable with the same default. Keep it outside any directory indexed as agent memory. |
-| `DOC_CACHE_MCP_GIT_PUSH` | `false` | Push that commit. **Off by default** — see below. |
-| `DOC_CACHE_MCP_DEPLOY_KEY_PATH` | unset | ssh key used for the push. Required when `GIT_PUSH` is on. |
-| `DOC_CACHE_MCP_PUSH_REMOTE` / `_PUSH_BRANCH` | `origin` / `main` | Push target. |
-| `DOC_CACHE_MCP_COMMIT_IDENTITY_NAME` / `_EMAIL` | `doc-cache-mcp` / `doc-cache-mcp@forge` | Identity for tool commits. |
-| `DOC_CACHE_MCP_AUDIT_LOG_DIR` | unset | Append-only JSONL sink (agent-bus shape) for every write decision and every provisional add. Unset = no audit events. |
+| Var | Required | Default | Purpose |
+|-----|----------|---------|---------|
+| `DOC_CACHE_MCP_TRANSPORT` | no | `http` | `http` (streamable-http, stateless) or `stdio`. |
+| `DOC_CACHE_MCP_HOST` | no | `127.0.0.1` | Bind host. Loopback only by design. |
+| `DOC_CACHE_MCP_PORT` | no | `8503` | Bind port. |
+| `DOC_CACHE_MCP_DOCSYNC_PATH` | no | `~/scripts/doc-sync.py` | Shared doc-sync logic to import. |
+| `DOC_CACHE_MCP_CONFIG_PATH` | no | `~/docs/doc-sync.yml` | Docs cache config the write tools edit (symlink resolved before writing). |
+| `DOC_CACHE_MCP_ALLOWLIST_PATH` | no | `~/repos/gitea/host-forge-scripts/doc-cache-allowlist.yml` | Source-URL allowlist. Missing or malformed denies everything. |
+| `DOC_CACHE_MCP_PROVISIONAL_CACHE_DIR` | no | `~/.claude/docs-provisional` | Where provisional chunks go. `doc-sync.py` reads the same variable with the same default. Keep it outside any directory indexed as agent memory. |
+| `DOC_CACHE_MCP_GIT_COMMIT` | no | `true` | Commit `doc-sync.yml` after each change. `false` writes the file only (`outcome: written`). |
+| `DOC_CACHE_MCP_GIT_PUSH` | no | `false` | Push that commit. **Off by default**; see [Pushing](#pushing). |
+| `DOC_CACHE_MCP_DEPLOY_KEY_PATH` | when `GIT_PUSH` is on | unset | ssh key used for the push. With `GIT_PUSH` on and no key at this path, every write is refused. |
+| `DOC_CACHE_MCP_PUSH_REMOTE` / `_PUSH_BRANCH` | no | `origin` / `main` | Push target. |
+| `DOC_CACHE_MCP_COMMIT_IDENTITY_NAME` / `_EMAIL` | no | `doc-cache-mcp` / `doc-cache-mcp@forge` | Identity for tool commits. |
+| `DOC_CACHE_MCP_AUDIT_LOG_DIR` | no | unset | Append-only JSONL sink (agent-bus shape) for every write decision and every provisional add. Unset = no audit events. |
+| `DOC_CACHE_MCP_MAX_ENTRIES_PER_ADD` | no | `50` | Ceiling on source entries accepted in one `add_service` call. |
+| `DOC_CACHE_MCP_MAX_REMOVE_PER_CALL` | no | `20` | Ceiling on topics removed in one `remove_topic` call. |
+
+The provisional tier's ceilings (`ttl_days`, `max_hosts`, `max_bytes`) are set in the
+allowlist file, not in the environment.
 
 ### Pushing
 
@@ -203,13 +212,75 @@ server, and every step is fail-closed — a check that cannot be *evaluated* is 
 7. **Audit** every decision to `AUDIT_LOG_DIR`, a trail outside git that survives a
    force-push.
 
-There is no review branch. Up to v0.2 a guard refusal pushed the commit to a review branch
-and left it on local `main`, where it put every later call's push range — and its
-`reason` — in the same state. Git history, the audit trail and the agent-bus event make
-each change attributable and revertible after the fact; repoints and removals come only
-from the explicit tools, so they are intended.
+A call either pushes its own commit or rolls it back; it never leaves a commit on the
+local branch without saying so in `outcome`. Git history, the audit trail and the
+agent-bus event make each change attributable and revertible after the fact; repoints and
+removals come only from the explicit tools, so they are intended.
 
 The deploy key should be mode `0600` and owned by the user the server runs as.
+
+## Installation
+
+Requirements:
+
+- Python 3.11+
+- A `doc-sync.py` that matches this release (failure state, `remove_topics`, provisional
+  tier), with the generated `doc_cache_allowlist.py` next to it (see
+  [Allowlist schema](#allowlist-schema-v2)).
+- `doc-sync.yml` inside a git checkout, if `GIT_COMMIT` is on (the default).
+- The allowlist file.
+
+```bash
+python3 -m venv /opt/venvs/doc-cache-mcp
+/opt/venvs/doc-cache-mcp/bin/pip install .                 # or ".[telemetry]"
+```
+
+0.3.1 raises dependency floors for security fixes (`mcp>=1.30.0` for CVE-2026-59951,
+`pyjwt>=2.15.0`, `anyio>=4.14.2`, `cryptography>=50.0.0`; `urllib3>=2.8.0` since 0.3.0).
+Reinstall into an existing venv after upgrading: pip keeps an installed dependency that
+still satisfies its spec, so only a floor moves it. The provisional tier fetches from
+unvetted hosts through urllib3, so do not enable it until the venv that runs `doc-sync.py`
+also has `urllib3>=2.8.0`.
+
+## Deployment
+
+**PM2.** `ecosystem.config.js` runs the installed `doc-cache-mcp` entry point over
+streamable-http on `127.0.0.1:8503`, with the paths, `GIT_PUSH`, the deploy key path and
+`AUDIT_LOG_DIR` set in its `env` block. Edit the paths for your host, then:
+
+```bash
+pm2 start ecosystem.config.js
+pm2 logs doc-cache-mcp
+```
+
+The HTTP transport is stateless (`stateless_http=True`): no tool keeps session state, and
+`doc_cache_sync`'s progress notifications still arrive on the request's own stream.
+
+**scoped-mcp.** Wire it in as an `mcp_proxy` module in the calling agent's manifest and
+name the tools it may use:
+
+```yaml
+modules:
+  doc-cache-mcp:
+    type: mcp_proxy
+    config:
+      url: http://localhost:8503/mcp
+      tool_allowlist:
+        - doc_cache_list_services
+        - doc_cache_add_service
+        - doc_cache_update_topic
+        - doc_cache_remove_topic
+        - doc_cache_sync
+rate_limits:
+  "doc-cache-mcp_doc_cache_sync": "10/minute"
+  "doc-cache-mcp_doc_cache_remove_topic": "5/minute"   # destructive
+```
+
+The tools then appear to the agent as `mcp__scoped-mcp__doc-cache-mcp_<tool>`.
+`tool_allowlist` restricts that agent only. The port itself has no authentication, so
+anything on the host that can reach loopback can call every tool, including
+`doc_cache_update_topic` and `doc_cache_remove_topic`. With `GIT_COMMIT` on, every config
+change is a git commit and can be reverted.
 
 ## Development
 
@@ -219,24 +290,18 @@ pip install -e ".[dev]"
 pytest
 ```
 
-## Deployment (forge)
-
-PM2 process on `127.0.0.1:8503` via `ecosystem.config.js`. See the build plan for the
-manifest cutover (removing research's `system-ops` grant) — that is a separate, gated
-sysadmin step.
-
 ## Observability
 
 Structured logging (structlog, JSON to stdout) is always on. Two optional backends are each
 gated on their own env var and disabled — with no import cost — when unset. Install the extras
 with `pip install ".[telemetry]"`.
 
-| Var | Enables |
-|-----|---------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP span export (e.g. `http://127.0.0.1:4317`). `service.name` is `doc-cache-mcp`. |
-| `INFLUXDB_URL` | Best-effort per-call metric emission to InfluxDB 3. |
-| `INFLUXDB_TOKEN` | Auth token for the InfluxDB backend. |
-| `INFLUXDB_DATABASE` | Target database. Falls back to `INFLUXDB_BUCKET`, then `doc-cache-mcp`. On forge PM2 sets `forge`, the database Grafana reads. |
+| Var | Required | Default | Purpose |
+|-----|----------|---------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | unset (tracing off) | OTLP gRPC span export (e.g. `http://127.0.0.1:4317`). `service.name` is `doc-cache-mcp`. |
+| `INFLUXDB_URL` | no | unset (metrics off) | Best-effort per-call metric emission to InfluxDB 3. |
+| `INFLUXDB_TOKEN` | no | empty | Auth token for the InfluxDB backend, if it requires one. |
+| `INFLUXDB_DATABASE` | no | `INFLUXDB_BUCKET`, then `doc-cache-mcp` | Target database. Set it to the database your dashboards read: before 0.3.1 only `INFLUXDB_BUCKET` was read, so a deployment that set `INFLUXDB_DATABASE` wrote every point to an unread `doc-cache-mcp` database. |
 
 ### Failure behaviour
 
