@@ -230,17 +230,78 @@ Requirements:
 - `doc-sync.yml` inside a git checkout, if `GIT_COMMIT` is on (the default).
 - The allowlist file.
 
+doc-cache-mcp is not published to PyPI. Install it from a checkout of a release tag, from
+the committed `uv.lock`, so the dependency set is the one CI tested and audited. Use
+[uv](https://docs.astral.sh/uv/).
+
+Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
+the run on failure, and that only works under `set -e` in a script.
+
 ```bash
-python3 -m venv /opt/venvs/doc-cache-mcp
-/opt/venvs/doc-cache-mcp/bin/pip install .                 # or ".[telemetry]"
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=0.4.0
+REPO=~/repos/doc-cache-mcp
+VENV=/opt/venvs/doc-cache-mcp
+PY=/usr/bin/python3.13
+EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
+die() { echo "install: $*" >&2; exit 1; }
+
+[ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/doc-cache-mcp "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
+git fetch --tags origin
+git checkout --quiet "v$VERSION"
+
+# 1. The checkout is exactly the release tag on the remote, and nothing else: the package
+#    is built from this tree. `git status` does not show ignored files, so remove bytecode
+#    and tool caches, then refuse anything left except a development venv and .env files.
+find . \( -path ./.venv -o -path ./venv \) -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
+  | xargs -0 -r rm -rf --
+rm -rf .pytest_cache .ruff_cache .coverage coverage.xml htmlcov build dist
+status=$(git status --porcelain --ignored)
+extra=$(printf '%s\n' "$status" | grep -vxE '(!! (\.?venv/|\.env|\.env\.[^/]+))?' || true)
+[ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
+$extra"
+# The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
+tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on origin"
+[ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
+
+# 2. Build a fresh venv at the path the service runs from. Stop the service and move the
+#    old venv aside first; this refuses to build over one. Pin the interpreter: uv
+#    otherwise prefers a Python it manages itself, which `uv python` can later remove or
+#    replace under a running service. --no-editable installs a copy of the package, so the
+#    service does not follow later changes to the checkout.
+[ ! -e "$VENV" ] || die "$VENV exists: stop the service and move it aside first"
+UV_PROJECT_ENVIRONMENT="$VENV" \
+  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY"
+
+# 3. The venv is exactly the lock (no missing, extra or different package), and the
+#    installed package imports and reports the release version.
+UV_PROJECT_ENVIRONMENT="$VENV" \
+  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
+  || die "venv does not match uv.lock"
+"$VENV/bin/python" - "$VERSION" <<'EOF' || die "installed package check failed"
+import importlib.metadata as m, sys, doc_cache_mcp.server
+assert m.version("doc-cache-mcp") == sys.argv[1], m.version("doc-cache-mcp")
+print("doc-cache-mcp", sys.argv[1])
+EOF
+[ -x "$VENV/bin/doc-cache-mcp" ] || die "entry point missing"
+echo "install: doc-cache-mcp v$VERSION ready in $VENV; restart the service"
 ```
 
-0.3.1 raises dependency floors for security fixes (`mcp>=1.30.0` for CVE-2026-59951,
-`pyjwt>=2.15.0`, `anyio>=4.14.2`, `cryptography>=50.0.0`; `urllib3>=2.8.0` since 0.3.0).
-Reinstall into an existing venv after upgrading: pip keeps an installed dependency that
-still satisfies its spec, so only a floor moves it. The provisional tier fetches from
-unvetted hosts through urllib3, so do not enable it until the venv that runs `doc-sync.py`
-also has `urllib3>=2.8.0`.
+Build a fresh venv rather than installing into an existing one: `pip install .` into an
+existing venv keeps whatever older dependency versions it finds there, if they still
+satisfy the declared ranges. Build at the final path rather than building elsewhere and
+moving it: console-script shebangs embed the venv path. A uv-built venv has no `pip`.
+
+CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
+result unless you watch it, and GitHub disables a public repository's scheduled workflows
+after 60 days without activity. Audit the deployed venv where it runs as well (for example
+`pip-audit --path /opt/venvs/doc-cache-mcp/lib/python3.13/site-packages`).
+
+The provisional tier fetches from unvetted hosts through requests and urllib3. The venv
+that runs `doc-sync.py` on its own (outside this server) needs the same floors.
 
 ## Deployment
 
@@ -285,9 +346,8 @@ change is a git commit and can be reverted.
 ## Development
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
-pytest
+uv sync --frozen --extra dev --extra telemetry
+uv run --frozen --no-sync pytest
 ```
 
 ## Observability

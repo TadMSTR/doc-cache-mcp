@@ -1,10 +1,12 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned exactly: uv.lock does not lock build dependencies, so a range here would let
+# every wheel build pick up whatever hatchling is newest that day.
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "doc-cache-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Capability-scoped FastMCP server for the forge documentation cache (list/add/sync + source-URL allowlist)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -18,27 +20,53 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
+# uv.lock is the contract: a deploy builds a fresh venv from it with `uv sync --frozen
+# --no-editable` (README, "Installation"), and CI audits the locked set. The ranges below
+# are what a fresh resolve may pick, and the CI `latest` job tests the newest of them.
 dependencies = [
-    "fastmcp>=2.0",
+    # Capped below 4: 4.x is a major this server has never run on. 3.4.10 is a security
+    # floor.
+    "fastmcp>=3.4.10,<4",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "structlog>=24.0",
     "PyYAML>=6.0",
     # Required by the imported doc-sync logic (fetch + HTML->markdown).
-    "requests>=2.31",
-    # 2.8.0 fixes two streaming-API flaws (GHSA-gh4c-6fx4-qh6g infinite loop,
-    # GHSA-vxq7-64xx-v4gw unbounded chunk-size buffer) that the provisional tier's capped,
-    # streamed read reaches from hosts nobody approved (audit F-01).
-    "urllib3>=2.8.0",
+    "requests>=2.33.0",
     "html2text>=2024.2.26",
-    # Floors only — venv-deploy keeps an installed dependency that still satisfies its
-    # spec, so a CVE fix reaches the venv only when the floor moves (p2 audit F-06).
-    # mcp 1.30.0 fixes CVE-2026-59951 (GHSA-84m7-p3x7-pcfv, unreclaimed streamable-HTTP
-    # sessions); the transport now also runs stateless, see server.main().
-    "mcp>=1.30.0",
-    "pyjwt>=2.15.0",
+    # SECURITY FLOORS on transitive dependencies (2026-10-30). None is imported here
+    # directly; each is declared only to hold its floor, the first release with a published
+    # security fix. uv.lock is the control; these are the second line, for an install that
+    # re-resolves.
+    #
+    # Scope, checked against every published advisory for every package in the locked
+    # runtime set. Every package a request reaches whose range still admitted an advisory
+    # has a floor:
+    # - the fetch path. doc-sync fetches every cached page through requests, urllib3, idna
+    #   and certifi, including from provisional hosts nobody approved, so these four are
+    #   on the request path for this server. requests is floored above.
+    # - the streamable-http transport: mcp, starlette, python-multipart, anyio, h11
+    #   (uvicorn's parser).
+    # - pyjwt (mcp's auth layer) and cryptography.
+    # - opentelemetry-api: fastmcp parses every tool call's `_meta` trace context with it,
+    #   whether or not a telemetry sink is configured.
+    # These ranges still admit an advisory but are held only by the lock, because no
+    # request reaches the affected code: authlib, joserfc (fastmcp's auth providers; none is
+    # configured), dnspython, jaraco-context, protobuf and pyarrow (telemetry exporters),
+    # pydantic-settings and python-dotenv (read the environment once at startup), pygments.
+    "urllib3>=2.8.0",
+    "idna>=3.15",
+    "certifi>=2026.10.18",
+    # Capped below 2 with fastmcp's own range. The transport also runs stateless, see
+    # server.main().
+    "mcp>=1.30.0,<2",
+    "starlette>=1.3.1",
+    "python-multipart>=0.0.31",
     "anyio>=4.14.2",
+    "h11>=0.16.0",
+    "pyjwt>=2.15.0",
     "cryptography>=50.0.0",
+    "opentelemetry-api>=1.45.1",
 ]
 
 [project.optional-dependencies]

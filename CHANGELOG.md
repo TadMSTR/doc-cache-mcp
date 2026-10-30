@@ -4,6 +4,45 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] — 2026-10-30
+
+First release with a committed `uv.lock`. No application code changed, and no tool changed.
+
+### Changed — install model
+- **The deployed venv is built from `uv.lock`.** The README "Installation" section is a
+  script: it checks that the checkout is exactly the release tag on origin with nothing
+  else in it (ignored files included), builds a fresh venv with `uv sync --frozen
+  --no-editable`, checks it against the lock with `uv sync --check`, and checks the
+  installed version. `pip install .` into an existing venv is no longer the documented
+  path: it keeps whatever older dependency versions it finds.
+
+### Changed — dependencies
+- **fastmcp is bounded:** `fastmcp>=3.4.10,<4` (was `>=2.0`, which admitted two majors this
+  server has never run on). `mcp` is capped `<2` with it.
+- **Security floors:** requests 2.33.0, idna 3.15, certifi 2026.10.18 (with the existing
+  urllib3 2.8.0 these cover the fetch path, which reaches unvetted provisional hosts),
+  starlette 1.3.1, python-multipart 0.0.31, h11 0.16.0, opentelemetry-api 1.45.1. The
+  `pyproject.toml` comment says why each is there and names the packages only the lock
+  holds.
+- Locked: fastmcp 3.4.11, mcp 1.30.0, starlette 1.10.0, requests 2.34.2, urllib3 2.8.0,
+  idna 3.20, certifi 2026.10.23, authlib 1.9.1, joserfc 1.7.7, dnspython 2.9.1,
+  cryptography 50.0.2.
+- **Build backend pinned:** `hatchling==1.33.0`. `uv.lock` does not lock build
+  dependencies.
+
+### Changed — CI
+- Tests, lint and format run from the lock (`uv sync --frozen --extra dev --extra
+  telemetry`) on 3.11–3.13.
+- New jobs: `uv lock --check`; separate runtime and dev audits of the locked set with a
+  pinned pip-audit; a gating `latest` job that re-resolves to the newest allowed versions,
+  on every push and weekly; a wheel build that installs and imports outside the tree.
+- Top-level `permissions: contents: read` in both workflows. The release job escalates to
+  `contents: write` itself, and its checkout sets `persist-credentials: false`, as every
+  checkout now does. Both workflows use one `actions/checkout` commit.
+
+### Changed — repository hygiene
+- `.gitignore`: `.env.*` is ignored.
+
 ## [0.3.1] — 2026-10-20
 
 Fixes from doc-cache-friction-2026-10 part 2 (vikunja#1172, audit F-04 and F-06). **Needs
