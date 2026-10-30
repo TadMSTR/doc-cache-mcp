@@ -281,7 +281,8 @@ UV_PROJECT_ENVIRONMENT="$VENV" \
 UV_PROJECT_ENVIRONMENT="$VENV" \
   uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
   || die "venv does not match uv.lock"
-"$VENV/bin/python" - "$VERSION" <<'EOF' || die "installed package check failed"
+# -I: import only what is installed in the venv, never from this checkout.
+"$VENV/bin/python" -I - "$VERSION" <<'EOF' || die "installed package check failed"
 import importlib.metadata as m, sys, doc_cache_mcp.server
 assert m.version("doc-cache-mcp") == sys.argv[1], m.version("doc-cache-mcp")
 print("doc-cache-mcp", sys.argv[1])
