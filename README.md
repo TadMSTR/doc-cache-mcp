@@ -230,17 +230,151 @@ Requirements:
 - `doc-sync.yml` inside a git checkout, if `GIT_COMMIT` is on (the default).
 - The allowlist file.
 
+doc-cache-mcp is not published to PyPI. The script below installs a release tag from a
+fresh clone of it, using that clone's committed `uv.lock`, so the dependency set is the one
+CI tested and audited. The checkout the service runs in is updated to the tag and compared
+with the clone, but nothing is installed from it. Use
+[uv](https://docs.astral.sh/uv/).
+
+Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
+the run on failure, and that only works under `set -e` in a script.
+
 ```bash
-python3 -m venv /opt/venvs/doc-cache-mcp
-/opt/venvs/doc-cache-mcp/bin/pip install .                 # or ".[telemetry]"
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=0.4.0
+URL=https://github.com/TadMSTR/doc-cache-mcp
+# The checkout PM2 runs in, and the venv it runs (ecosystem.config.js).
+REPO=${REPO:-$HOME/repos/personal/doc-cache-mcp}
+VENV=${VENV:-/opt/venvs/doc-cache-mcp}
+PY=/usr/bin/python3.13
+EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
+die() { echo "install: $*" >&2; exit 1; }
+tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
+# Git without the system or global config (no URL rewrites, no hooks, no fsmonitor).
+gx() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
+
+# 0. Stop the service and move its venv aside BEFORE this runs; this refuses to build
+#    over one.
+[ ! -e "$VENV" ] || die "$VENV exists: stop the service and move it aside first"
+[ -d "$REPO/.git" ] || gx clone --quiet "$URL" "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
+
+# 1. The release, fresh from the network. Everything installed comes from this clone,
+#    never from the checkout: a long-lived checkout's index, config and object store can
+#    all misreport what it holds. The tag's commit is read from the same URL.
+tag=$(gx ls-remote "$URL" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on $URL"
+gx clone --quiet --depth 1 --branch "v$VERSION" "$URL" "$tmp/src"
+[ "$(gx -C "$tmp/src" rev-parse HEAD)" = "$tag" ] || die "fresh clone is not v$VERSION ($tag)"
+
+# 2. The checkout PM2 runs in must be exactly the release too: the server reads a `.env`
+#    from its working directory as configuration. Move it to the tag, remove bytecode
+#    and tool caches, then compare every file with the fresh clone, byte for byte, in
+#    Python: no git status, index or config is trusted. A development venv is allowed.
+gx --git-dir="$REPO/.git" --work-tree="$REPO" fetch --quiet "$URL" "refs/tags/v$VERSION"
+gx --git-dir="$REPO/.git" --work-tree="$REPO" checkout --quiet --detach "$tag"
+find . \( -path ./.git -o -path ./.venv -o -path ./venv \) -prune -o \
+  \( -name __pycache__ -o -name '*.py[co]' \) -print0 | xargs -0 -r rm -rf --
+rm -rf .pytest_cache .ruff_cache .coverage coverage.xml htmlcov build dist
+"$PY" -I - "$REPO" "$tmp/src" .venv venv <<'EOF' || die "checkout differs from v$VERSION; fix the files listed above"
+import os, sys, pathlib
+# argv: <live checkout> <fresh clone> <top-level names to skip in the live checkout>...
+live, ref, skip = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), set(sys.argv[3:])
+
+def entries(root, top_skip):
+    out = {}
+    for d, dirs, files in os.walk(root):
+        rel = pathlib.Path(d).relative_to(root)
+        if rel == pathlib.Path("."):
+            dirs[:] = [x for x in dirs if x not in top_skip]
+            files = [x for x in files if x not in top_skip]
+        for x in [x for x in dirs if (pathlib.Path(d) / x).is_symlink()]:
+            dirs.remove(x)
+            files.append(x)
+        for f in files:
+            out[(rel / f).as_posix()] = pathlib.Path(d) / f
+    return out
+
+def same(a, b):
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+
+have, want = entries(live, skip | {".git"}), entries(ref, {".git"})
+extra, missing = sorted(have.keys() - want.keys()), sorted(want.keys() - have.keys())
+differ = sorted(k for k in have.keys() & want.keys() if not same(have[k], want[k]))
+if extra or missing or differ:
+    sys.exit(f"extra: {extra}\nmissing: {missing}\ndiffer: {differ}")
+print(f"install: checkout matches the release, {len(want)} files")
+EOF
+
+# 3. Build a fresh venv at the path the service runs from, from the clone's own
+#    pyproject.toml and uv.lock. Pin the interpreter: uv otherwise prefers a Python it
+#    manages itself, which `uv python` can later remove or replace under a running
+#    service. --no-editable installs a copy of the package. --no-config: no uv.toml
+#    outside the project. --no-cache: nothing an earlier run cached.
+UV_PROJECT_ENVIRONMENT="$VENV" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
+
+# 4. The venv is exactly the lock (no missing, extra or different package), and every
+#    file the install recorded (the dist-info RECORD), wherever in the venv it was
+#    written, is byte-for-byte a wheel built from the same clone.
+UV_PROJECT_ENVIRONMENT="$VENV" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
+  || die "venv does not match uv.lock"
+uv build --no-config --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
+"$VENV/bin/python" -I - "$tmp"/dist/*.whl "$VENV/lib/python3.13/site-packages" <<'EOF' \
+  || die "installed package differs from the v$VERSION wheel"
+import base64, configparser, csv, hashlib, sys, zipfile, pathlib
+whl, site = zipfile.ZipFile(sys.argv[1]), pathlib.Path(sys.argv[2])
+names = {n for n in whl.namelist() if not n.endswith("/")}
+di = next(n for n in names if n.endswith(".dist-info/RECORD")).rsplit("/", 1)[0]
+# Written by the installer, not shipped in the wheel. Everything else the install wrote
+# is listed in the installed RECORD and must be exactly the wheel's file.
+by_installer = {f"{di}/{x}" for x in ("RECORD", "INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json", "uv_build.json")}
+eps = configparser.ConfigParser(delimiters=("=",))
+eps.optionxform = str
+eps.read_string(whl.read(f"{di}/entry_points.txt").decode() if f"{di}/entry_points.txt" in names else "")
+scripts = {f"../../../bin/{s}" for s in (eps["console_scripts"] if eps.has_section("console_scripts") else {})}
+record = [r[0] for r in csv.reader((site / di / "RECORD").read_text().splitlines()) if r]
+installed = {p for p in record if p not in by_installer and p not in scripts}
+want = names - by_installer
+missing, extra = sorted(want - installed), sorted(installed - want)
+bad = sorted(n for n in want & installed
+             if not (site / n).is_file() or (site / n).read_bytes() != whl.read(n))
+unlisted = sorted(s for s in record if s.startswith("../") and s not in scripts)
+assert not (missing or extra or bad or unlisted), (
+    f"missing: {missing} extra: {extra} differ: {bad} outside site-packages: {unlisted}")
+print(f"install: all {len(want)} files match the release wheel (RECORD)")
+EOF
+# -I: import only what is installed in the venv, never from this checkout.
+"$VENV/bin/python" -I - "$VERSION" <<'EOF' || die "installed package check failed"
+import importlib.metadata as m, sys, doc_cache_mcp.server
+assert m.version("doc-cache-mcp") == sys.argv[1], m.version("doc-cache-mcp")
+print("doc-cache-mcp", sys.argv[1])
+EOF
+[ -x "$VENV/bin/doc-cache-mcp" ] || die "entry point missing"
+echo "install: doc-cache-mcp v$VERSION ready in $VENV; restart the service by name"
 ```
 
-0.3.1 raises dependency floors for security fixes (`mcp>=1.30.0` for CVE-2026-59951,
-`pyjwt>=2.15.0`, `anyio>=4.14.2`, `cryptography>=50.0.0`; `urllib3>=2.8.0` since 0.3.0).
-Reinstall into an existing venv after upgrading: pip keeps an installed dependency that
-still satisfies its spec, so only a floor moves it. The provisional tier fetches from
-unvetted hosts through urllib3, so do not enable it until the venv that runs `doc-sync.py`
-also has `urllib3>=2.8.0`.
+Build a fresh venv rather than installing into an existing one: `pip install .` into an
+existing venv keeps whatever older dependency versions it finds there, if they still
+satisfy the declared ranges. Build at the final path rather than building elsewhere and
+moving it: console-script shebangs embed the venv path. A uv-built venv has no `pip`.
+Stop the service and move its venv aside before running the script (step 0 refuses to run
+otherwise), then restart it by name. Set `REPO` and `VENV` if your paths differ.
+
+CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
+result unless you watch it, and GitHub disables a public repository's scheduled workflows
+after 60 days without activity. Audit the deployed venv where it runs as well (for example
+`pip-audit --path /opt/venvs/doc-cache-mcp/lib/python3.13/site-packages`).
+
+The provisional tier fetches from unvetted hosts through requests and urllib3. The venv
+that runs `doc-sync.py` on its own (outside this server) needs the same floors.
 
 ## Deployment
 
@@ -285,9 +419,8 @@ change is a git commit and can be reverted.
 ## Development
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
-pytest
+uv sync --frozen --extra dev --extra telemetry
+uv run --frozen --no-sync pytest
 ```
 
 ## Observability

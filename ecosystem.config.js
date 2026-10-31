@@ -1,7 +1,9 @@
 // PM2 process definition for forge deployment.
 // Runs the installed entry point over streamable-http bound to loopback. No secrets here —
 // the server holds no credentials; its only write surface is doc-sync.yml + the docs cache.
-// Deploy (sysadmin): create /opt/venvs/doc-cache-mcp, `pip install .`, then start this.
+// Deploy (sysadmin): build /opt/venvs/doc-cache-mcp from uv.lock with the install script in
+// README.md ("Installation"), then start this. Upgrades: stop, move the venv aside, rebuild,
+// `pm2 restart doc-cache-mcp`.
 module.exports = {
   apps: [{
     name: "doc-cache-mcp",
