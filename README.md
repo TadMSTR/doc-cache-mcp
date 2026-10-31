@@ -241,25 +241,35 @@ the run on failure, and that only works under `set -e` in a script.
 #!/usr/bin/env bash
 set -euo pipefail
 VERSION=0.4.0
-REPO=~/repos/doc-cache-mcp
-VENV=/opt/venvs/doc-cache-mcp
+# The checkout the package is built from, and the venv PM2 runs (ecosystem.config.js).
+REPO=${REPO:-$HOME/repos/personal/doc-cache-mcp}
+VENV=${VENV:-/opt/venvs/doc-cache-mcp}
 PY=/usr/bin/python3.13
 EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
 die() { echo "install: $*" >&2; exit 1; }
+tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
 
+# 0. Stop the service and move its venv aside BEFORE this runs; this refuses to build
+#    over one.
+[ ! -e "$VENV" ] || die "$VENV exists: stop the service and move it aside first"
 [ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/doc-cache-mcp "$REPO"
 cd "$REPO" || die "cannot enter $REPO"
 git fetch --tags origin
 git checkout --quiet "v$VERSION"
 
 # 1. The checkout is exactly the release tag on the remote, and nothing else: the package
-#    is built from this tree. `git status` does not show ignored files, so remove bytecode
-#    and tool caches, then refuse anything left except a development venv and .env files.
+#    is built from this tree. `git status` does not show ignored files, or tracked files
+#    flagged assume-unchanged or skip-worktree. Remove bytecode and tool caches, then
+#    refuse any flagged file and anything left except a development venv. A `.env` is
+#    refused too: the server reads it from its working directory as configuration.
 find . \( -path ./.venv -o -path ./venv \) -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
   | xargs -0 -r rm -rf --
 rm -rf .pytest_cache .ruff_cache .coverage coverage.xml htmlcov build dist
+flagged=$(git ls-files -v | grep -v '^H ' || true)
+[ -z "$flagged" ] || die "tracked files flagged out of git status; clear the flags first:
+$flagged"
 status=$(git status --porcelain --ignored)
-extra=$(printf '%s\n' "$status" | grep -vxE '(!! (\.?venv/|\.env|\.env\.[^/]+))?' || true)
+extra=$(printf '%s\n' "$status" | grep -vxE '(!! \.?venv/)?' || true)
 [ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
 $extra"
 # The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
@@ -267,20 +277,36 @@ tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail
 [ -n "$tag" ] || die "tag v$VERSION is not on origin"
 [ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
 
-# 2. Build a fresh venv at the path the service runs from. Stop the service and move the
-#    old venv aside first; this refuses to build over one. Pin the interpreter: uv
+# 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
 #    otherwise prefers a Python it manages itself, which `uv python` can later remove or
 #    replace under a running service. --no-editable installs a copy of the package, so the
-#    service does not follow later changes to the checkout.
-[ ! -e "$VENV" ] || die "$VENV exists: stop the service and move it aside first"
+#    service does not follow later changes to the checkout. --no-cache: build this project
+#    from this tree, not from a wheel uv cached on an earlier run.
 UV_PROJECT_ENVIRONMENT="$VENV" \
-  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY"
+  uv sync --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
 
 # 3. The venv is exactly the lock (no missing, extra or different package), and the
-#    installed package imports and reports the release version.
+#    installed package is byte-for-byte the release: build a wheel from the tag's own
+#    objects (`git archive`) and compare every file with what was installed.
 UV_PROJECT_ENVIRONMENT="$VENV" \
   uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
   || die "venv does not match uv.lock"
+mkdir "$tmp/src"
+git archive "$tag" | tar -x -C "$tmp/src"
+uv build --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
+"$VENV/bin/python" -I - "$tmp"/dist/*.whl "$VENV/lib/python3.13/site-packages" <<'EOF' \
+  || die "installed package differs from the v$VERSION wheel"
+import sys, zipfile, pathlib
+whl, site = zipfile.ZipFile(sys.argv[1]), pathlib.Path(sys.argv[2])
+names = [n for n in whl.namelist() if not n.endswith("/") and ".dist-info/" not in n]
+bad = [n for n in names if not (site / n).is_file() or (site / n).read_bytes() != whl.read(n)]
+tops = {n.split("/")[0] for n in names}
+extra = sorted(str(p.relative_to(site)) for t in tops for p in (site / t).rglob("*")
+               if p.is_file() and "__pycache__" not in p.parts
+               and str(p.relative_to(site)) not in names)
+assert not bad and not extra, f"differ: {bad} extra: {extra}"
+print(f"install: {len(names)} files match the release wheel")
+EOF
 # -I: import only what is installed in the venv, never from this checkout.
 "$VENV/bin/python" -I - "$VERSION" <<'EOF' || die "installed package check failed"
 import importlib.metadata as m, sys, doc_cache_mcp.server
@@ -288,13 +314,15 @@ assert m.version("doc-cache-mcp") == sys.argv[1], m.version("doc-cache-mcp")
 print("doc-cache-mcp", sys.argv[1])
 EOF
 [ -x "$VENV/bin/doc-cache-mcp" ] || die "entry point missing"
-echo "install: doc-cache-mcp v$VERSION ready in $VENV; restart the service"
+echo "install: doc-cache-mcp v$VERSION ready in $VENV; restart the service by name"
 ```
 
 Build a fresh venv rather than installing into an existing one: `pip install .` into an
 existing venv keeps whatever older dependency versions it finds there, if they still
 satisfy the declared ranges. Build at the final path rather than building elsewhere and
 moving it: console-script shebangs embed the venv path. A uv-built venv has no `pip`.
+Stop the service and move its venv aside before running the script (step 0 refuses to run
+otherwise), then restart it by name. Set `REPO` and `VENV` if your paths differ.
 
 CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
 result unless you watch it, and GitHub disables a public repository's scheduled workflows

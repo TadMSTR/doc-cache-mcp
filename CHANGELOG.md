@@ -13,7 +13,10 @@ First release with a committed `uv.lock`. No application code changed, and no to
   script: it checks that the checkout is exactly the release tag on origin with nothing
   else in it (ignored files included), builds a fresh venv with `uv sync --frozen
   --no-editable`, checks it against the lock with `uv sync --check`, and checks the
-  installed version. `pip install .` into an existing venv is no longer the documented
+  installed version. It also refuses tracked files hidden from `git status` (assume-unchanged,
+  skip-worktree) and a `.env` in the checkout, builds without uv's cache, and compares every
+  installed package file with a wheel built from the tag (`git archive`). `pip install .`
+  into an existing venv is no longer the documented
   path: it keeps whatever older dependency versions it finds.
 
 ### Changed — dependencies
