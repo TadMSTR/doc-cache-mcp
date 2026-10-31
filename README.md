@@ -247,15 +247,17 @@ VENV=${VENV:-/opt/venvs/doc-cache-mcp}
 PY=/usr/bin/python3.13
 EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
 die() { echo "install: $*" >&2; exit 1; }
+# Git config must not change what the checks see: no fsmonitor hook, no untracked cache.
+g() { git -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
 tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
 
 # 0. Stop the service and move its venv aside BEFORE this runs; this refuses to build
 #    over one.
 [ ! -e "$VENV" ] || die "$VENV exists: stop the service and move it aside first"
-[ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/doc-cache-mcp "$REPO"
+[ -d "$REPO/.git" ] || g clone https://github.com/TadMSTR/doc-cache-mcp "$REPO"
 cd "$REPO" || die "cannot enter $REPO"
-git fetch --tags origin
-git checkout --quiet "v$VERSION"
+g fetch --tags origin
+g checkout --quiet "v$VERSION"
 
 # 1. The checkout is exactly the release tag on the remote, and nothing else: the package
 #    is built from this tree. `git status` does not show ignored files, or tracked files
@@ -265,17 +267,19 @@ git checkout --quiet "v$VERSION"
 find . \( -path ./.venv -o -path ./venv \) -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
   | xargs -0 -r rm -rf --
 rm -rf .pytest_cache .ruff_cache .coverage coverage.xml htmlcov build dist
-flagged=$(git ls-files -v | grep -v '^H ' || true)
+flagged=$(g ls-files -v | grep -v '^H ' || true)
 [ -z "$flagged" ] || die "tracked files flagged out of git status; clear the flags first:
 $flagged"
-status=$(git status --porcelain --ignored)
+# Modes on the command line: status.showUntrackedFiles=no would otherwise hide every
+# untracked and ignored path.
+status=$(g status --porcelain --ignored=traditional --untracked-files=normal)
 extra=$(printf '%s\n' "$status" | grep -vxE '(!! \.?venv/)?' || true)
 [ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
 $extra"
 # The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
-tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+tag=$(g ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
 [ -n "$tag" ] || die "tag v$VERSION is not on origin"
-[ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
+[ "$(g rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
 
 # 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
 #    otherwise prefers a Python it manages itself, which `uv python` can later remove or
@@ -287,25 +291,37 @@ UV_PROJECT_ENVIRONMENT="$VENV" \
 
 # 3. The venv is exactly the lock (no missing, extra or different package), and the
 #    installed package is byte-for-byte the release: build a wheel from the tag's own
-#    objects (`git archive`) and compare every file with what was installed.
+#    objects (`git archive`) and compare it with every file the install recorded (the
+#    dist-info RECORD), wherever in the venv it was written.
 UV_PROJECT_ENVIRONMENT="$VENV" \
   uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
   || die "venv does not match uv.lock"
 mkdir "$tmp/src"
-git archive "$tag" | tar -x -C "$tmp/src"
+g archive "$tag" | tar -x -C "$tmp/src"
 uv build --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
 "$VENV/bin/python" -I - "$tmp"/dist/*.whl "$VENV/lib/python3.13/site-packages" <<'EOF' \
   || die "installed package differs from the v$VERSION wheel"
-import sys, zipfile, pathlib
+import base64, configparser, csv, hashlib, sys, zipfile, pathlib
 whl, site = zipfile.ZipFile(sys.argv[1]), pathlib.Path(sys.argv[2])
-names = [n for n in whl.namelist() if not n.endswith("/") and ".dist-info/" not in n]
-bad = [n for n in names if not (site / n).is_file() or (site / n).read_bytes() != whl.read(n)]
-tops = {n.split("/")[0] for n in names}
-extra = sorted(str(p.relative_to(site)) for t in tops for p in (site / t).rglob("*")
-               if p.is_file() and "__pycache__" not in p.parts
-               and str(p.relative_to(site)) not in names)
-assert not bad and not extra, f"differ: {bad} extra: {extra}"
-print(f"install: {len(names)} files match the release wheel")
+names = {n for n in whl.namelist() if not n.endswith("/")}
+di = next(n for n in names if n.endswith(".dist-info/RECORD")).rsplit("/", 1)[0]
+# Written by the installer, not shipped in the wheel. Everything else the install wrote
+# is listed in the installed RECORD and must be exactly the wheel's file.
+by_installer = {f"{di}/{x}" for x in ("RECORD", "INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json", "uv_build.json")}
+eps = configparser.ConfigParser(delimiters=("=",))
+eps.optionxform = str
+eps.read_string(whl.read(f"{di}/entry_points.txt").decode() if f"{di}/entry_points.txt" in names else "")
+scripts = {f"../../../bin/{s}" for s in (eps["console_scripts"] if eps.has_section("console_scripts") else {})}
+record = [r[0] for r in csv.reader((site / di / "RECORD").read_text().splitlines()) if r]
+installed = {p for p in record if p not in by_installer and p not in scripts}
+want = names - by_installer
+missing, extra = sorted(want - installed), sorted(installed - want)
+bad = sorted(n for n in want & installed
+             if not (site / n).is_file() or (site / n).read_bytes() != whl.read(n))
+unlisted = sorted(s for s in record if s.startswith("../") and s not in scripts)
+assert not (missing or extra or bad or unlisted), (
+    f"missing: {missing} extra: {extra} differ: {bad} outside site-packages: {unlisted}")
+print(f"install: all {len(want)} files match the release wheel (RECORD)")
 EOF
 # -I: import only what is installed in the venv, never from this checkout.
 "$VENV/bin/python" -I - "$VERSION" <<'EOF' || die "installed package check failed"

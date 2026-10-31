@@ -9,15 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 First release with a committed `uv.lock`. No application code changed, and no tool changed.
 
 ### Changed — install model
+
 - **The deployed venv is built from `uv.lock`.** The README "Installation" section is a
-  script: it checks that the checkout is exactly the release tag on origin with nothing
-  else in it (ignored files included), builds a fresh venv with `uv sync --frozen
-  --no-editable`, checks it against the lock with `uv sync --check`, and checks the
-  installed version. It also refuses tracked files hidden from `git status` (assume-unchanged,
+  script: it checks that the checkout is exactly the release tag on origin with nothing else
+  in it (ignored files included), builds a fresh venv with `uv sync --frozen --no-editable`,
+  checks it against the lock with `uv sync --check`, and checks the installed version. Git
+  config cannot change what it sees (status modes and `core.fsmonitor` are set on the
+  command line). It also refuses tracked files hidden from `git status` (assume-unchanged,
   skip-worktree) and a `.env` in the checkout, builds without uv's cache, and compares every
-  installed package file with a wheel built from the tag (`git archive`). `pip install .`
-  into an existing venv is no longer the documented
-  path: it keeps whatever older dependency versions it finds.
+  file the install recorded (the dist-info RECORD) with a wheel built from the tag (`git
+  archive`). `pip install .` into an existing venv is no longer the documented path: it
+  keeps whatever older dependency versions it finds.
 
 ### Changed — dependencies
 - **fastmcp is bounded:** `fastmcp>=3.4.10,<4` (was `>=2.0`, which admitted two majors this
