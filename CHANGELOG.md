@@ -11,14 +11,15 @@ First release with a committed `uv.lock`. No application code changed, and no to
 ### Changed — install model
 
 - **The deployed venv is built from `uv.lock`.** The README "Installation" section is a
-  script: it checks that the checkout is exactly the release tag on origin with nothing else
-  in it (ignored files included), builds a fresh venv with `uv sync --frozen --no-editable`,
-  checks it against the lock with `uv sync --check`, and checks the installed version. Git
-  config cannot change what it sees (status modes and `core.fsmonitor` are set on the
-  command line). It also refuses tracked files hidden from `git status` (assume-unchanged,
-  skip-worktree) and a `.env` in the checkout, builds without uv's cache, and compares every
-  file the install recorded (the dist-info RECORD) with a wheel built from the tag (`git
-  archive`). `pip install .` into an existing venv is no longer the documented path: it
+  script. It clones the release tag fresh from GitHub (system and global git config
+  ignored), checks that the clone is the commit the tag names on GitHub, and builds a fresh
+  venv from that clone with `uv sync --frozen --no-editable --no-cache --no-config`, so the
+  lock and source that are installed are the release's and never the checkout's. It checks
+  the venv against the lock (`uv sync --check`), compares every file the install recorded
+  (the dist-info RECORD) with a wheel built from the clone, and checks the installed
+  version. The checkout the service runs in is moved to the tag, cleared of bytecode and
+  tool caches, and compared file by file with the clone; a `.env` or an edited file stops
+  the install. `pip install .` into an existing venv is no longer the documented path: it
   keeps whatever older dependency versions it finds.
 
 ### Changed — dependencies

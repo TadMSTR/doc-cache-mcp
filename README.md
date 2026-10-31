@@ -230,8 +230,10 @@ Requirements:
 - `doc-sync.yml` inside a git checkout, if `GIT_COMMIT` is on (the default).
 - The allowlist file.
 
-doc-cache-mcp is not published to PyPI. Install it from a checkout of a release tag, from
-the committed `uv.lock`, so the dependency set is the one CI tested and audited. Use
+doc-cache-mcp is not published to PyPI. The script below installs a release tag from a
+fresh clone of it, using that clone's committed `uv.lock`, so the dependency set is the one
+CI tested and audited. The checkout the service runs in is updated to the tag and compared
+with the clone, but nothing is installed from it. Use
 [uv](https://docs.astral.sh/uv/).
 
 Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
@@ -241,64 +243,90 @@ the run on failure, and that only works under `set -e` in a script.
 #!/usr/bin/env bash
 set -euo pipefail
 VERSION=0.4.0
-# The checkout the package is built from, and the venv PM2 runs (ecosystem.config.js).
+URL=https://github.com/TadMSTR/doc-cache-mcp
+# The checkout PM2 runs in, and the venv it runs (ecosystem.config.js).
 REPO=${REPO:-$HOME/repos/personal/doc-cache-mcp}
 VENV=${VENV:-/opt/venvs/doc-cache-mcp}
 PY=/usr/bin/python3.13
 EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
 die() { echo "install: $*" >&2; exit 1; }
-# Git config must not change what the checks see: no fsmonitor hook, no untracked cache.
-g() { git -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
 tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
+# Git without the system or global config (no URL rewrites, no hooks, no fsmonitor).
+gx() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
 
 # 0. Stop the service and move its venv aside BEFORE this runs; this refuses to build
 #    over one.
 [ ! -e "$VENV" ] || die "$VENV exists: stop the service and move it aside first"
-[ -d "$REPO/.git" ] || g clone https://github.com/TadMSTR/doc-cache-mcp "$REPO"
+[ -d "$REPO/.git" ] || gx clone --quiet "$URL" "$REPO"
 cd "$REPO" || die "cannot enter $REPO"
-g fetch --tags origin
-g checkout --quiet "v$VERSION"
 
-# 1. The checkout is exactly the release tag on the remote, and nothing else: the package
-#    is built from this tree. `git status` does not show ignored files, or tracked files
-#    flagged assume-unchanged or skip-worktree. Remove bytecode and tool caches, then
-#    refuse any flagged file and anything left except a development venv. A `.env` is
-#    refused too: the server reads it from its working directory as configuration.
-find . \( -path ./.venv -o -path ./venv \) -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
-  | xargs -0 -r rm -rf --
+# 1. The release, fresh from the network. Everything installed comes from this clone,
+#    never from the checkout: a long-lived checkout's index, config and object store can
+#    all misreport what it holds. The tag's commit is read from the same URL.
+tag=$(gx ls-remote "$URL" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on $URL"
+gx clone --quiet --depth 1 --branch "v$VERSION" "$URL" "$tmp/src"
+[ "$(gx -C "$tmp/src" rev-parse HEAD)" = "$tag" ] || die "fresh clone is not v$VERSION ($tag)"
+
+# 2. The checkout PM2 runs in must be exactly the release too: the server reads a `.env`
+#    from its working directory as configuration. Move it to the tag, remove bytecode
+#    and tool caches, then compare every file with the fresh clone, byte for byte, in
+#    Python: no git status, index or config is trusted. A development venv is allowed.
+gx --git-dir="$REPO/.git" --work-tree="$REPO" fetch --quiet "$URL" "refs/tags/v$VERSION"
+gx --git-dir="$REPO/.git" --work-tree="$REPO" checkout --quiet --detach "$tag"
+find . \( -path ./.git -o -path ./.venv -o -path ./venv \) -prune -o \
+  \( -name __pycache__ -o -name '*.py[co]' \) -print0 | xargs -0 -r rm -rf --
 rm -rf .pytest_cache .ruff_cache .coverage coverage.xml htmlcov build dist
-flagged=$(g ls-files -v | grep -v '^H ' || true)
-[ -z "$flagged" ] || die "tracked files flagged out of git status; clear the flags first:
-$flagged"
-# Modes on the command line: status.showUntrackedFiles=no would otherwise hide every
-# untracked and ignored path.
-status=$(g status --porcelain --ignored=traditional --untracked-files=normal)
-extra=$(printf '%s\n' "$status" | grep -vxE '(!! \.?venv/)?' || true)
-[ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
-$extra"
-# The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
-tag=$(g ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
-[ -n "$tag" ] || die "tag v$VERSION is not on origin"
-[ "$(g rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
+"$PY" -I - "$REPO" "$tmp/src" .venv venv <<'EOF' || die "checkout differs from v$VERSION; fix the files listed above"
+import os, sys, pathlib
+# argv: <live checkout> <fresh clone> <top-level names to skip in the live checkout>...
+live, ref, skip = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), set(sys.argv[3:])
 
-# 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
-#    otherwise prefers a Python it manages itself, which `uv python` can later remove or
-#    replace under a running service. --no-editable installs a copy of the package, so the
-#    service does not follow later changes to the checkout. --no-cache: build this project
-#    from this tree, not from a wheel uv cached on an earlier run.
-UV_PROJECT_ENVIRONMENT="$VENV" \
-  uv sync --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
+def entries(root, top_skip):
+    out = {}
+    for d, dirs, files in os.walk(root):
+        rel = pathlib.Path(d).relative_to(root)
+        if rel == pathlib.Path("."):
+            dirs[:] = [x for x in dirs if x not in top_skip]
+            files = [x for x in files if x not in top_skip]
+        for x in [x for x in dirs if (pathlib.Path(d) / x).is_symlink()]:
+            dirs.remove(x)
+            files.append(x)
+        for f in files:
+            out[(rel / f).as_posix()] = pathlib.Path(d) / f
+    return out
 
-# 3. The venv is exactly the lock (no missing, extra or different package), and the
-#    installed package is byte-for-byte the release: build a wheel from the tag's own
-#    objects (`git archive`) and compare it with every file the install recorded (the
-#    dist-info RECORD), wherever in the venv it was written.
-UV_PROJECT_ENVIRONMENT="$VENV" \
-  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
+def same(a, b):
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+
+have, want = entries(live, skip | {".git"}), entries(ref, {".git"})
+extra, missing = sorted(have.keys() - want.keys()), sorted(want.keys() - have.keys())
+differ = sorted(k for k in have.keys() & want.keys() if not same(have[k], want[k]))
+if extra or missing or differ:
+    sys.exit(f"extra: {extra}\nmissing: {missing}\ndiffer: {differ}")
+print(f"install: checkout matches the release, {len(want)} files")
+EOF
+
+# 3. Build a fresh venv at the path the service runs from, from the clone's own
+#    pyproject.toml and uv.lock. Pin the interpreter: uv otherwise prefers a Python it
+#    manages itself, which `uv python` can later remove or replace under a running
+#    service. --no-editable installs a copy of the package. --no-config: no uv.toml
+#    outside the project. --no-cache: nothing an earlier run cached.
+UV_PROJECT_ENVIRONMENT="$VENV" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
+
+# 4. The venv is exactly the lock (no missing, extra or different package), and every
+#    file the install recorded (the dist-info RECORD), wherever in the venv it was
+#    written, is byte-for-byte a wheel built from the same clone.
+UV_PROJECT_ENVIRONMENT="$VENV" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
   || die "venv does not match uv.lock"
-mkdir "$tmp/src"
-g archive "$tag" | tar -x -C "$tmp/src"
-uv build --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
+uv build --no-config --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
 "$VENV/bin/python" -I - "$tmp"/dist/*.whl "$VENV/lib/python3.13/site-packages" <<'EOF' \
   || die "installed package differs from the v$VERSION wheel"
 import base64, configparser, csv, hashlib, sys, zipfile, pathlib
