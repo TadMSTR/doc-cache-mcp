@@ -18,8 +18,10 @@ module.exports = {
       DOC_CACHE_MCP_CONFIG_PATH: "/home/ted/docs/doc-sync.yml",
       DOC_CACHE_MCP_ALLOWLIST_PATH: "/home/ted/repos/gitea/host-forge-scripts/doc-cache-allowlist.yml",
       // Push capability (vikunja#363) — enabled 2026-08-13 so research can
-      // complete docs-cache preflights unaided. Deploy key is write-scoped
-      // to host-forge/scripts only.
+      // complete docs-cache preflights unaided. The commit repo is the one
+      // CONFIG_PATH resolves into: since 2026-11-11 that is the dedicated
+      // host-forge/doc-cache repo, and the deploy key is write-scoped to
+      // that repo only. It has no access to host-forge/scripts.
       DOC_CACHE_MCP_GIT_PUSH: "true",
       DOC_CACHE_MCP_DEPLOY_KEY_PATH: "/home/ted/.secrets/doc-cache-mcp-deploy",
       DOC_CACHE_MCP_AUDIT_LOG_DIR: "/home/ted/.claude/comms/logs",

@@ -1,7 +1,8 @@
 """The docs-cache config write path: every call finishes or fails, and says which.
 
-``doc-sync.yml`` lives in a shared git repo that a cron and humans also use. A config change
-from this tool is one atomic sequence, run under a process-wide lock by the server:
+``doc-sync.yml`` lives in a git repo (a dedicated one, see the README's "Config repository")
+that a cron reads and humans may also edit. A config change from this tool is one atomic
+sequence, run under a process-wide lock by the server:
 
 1. **Precondition, before anything is written** (:func:`precondition`). The config file has
    no uncommitted changes, and — when pushing — the checkout is on the target branch and is

@@ -4,6 +4,18 @@ All notable changes to doc-cache-mcp are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Documentation
+
+- **README: new "Config repository" section.** Keep `doc-sync.yml` in a repository of its
+  own, not in a shared ops or scripts repository. The section explains how the server finds
+  its commit repository from the resolved config path, so moving the file only means
+  repointing the symlink. The deploy key must be write-scoped to that repository alone.
+  The Pushing warning and the Installation requirements point to it. The `push.py` module
+  docstring and the `ecosystem.config.js` comment now describe the same layout. No code
+  change.
+
 ## [0.4.0] — 2026-10-30
 
 First release with a committed `uv.lock`. No application code changed, and no tool changed.
