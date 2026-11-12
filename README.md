@@ -178,11 +178,39 @@ them to match yours.
 The provisional tier's ceilings (`ttl_days`, `max_hosts`, `max_bytes`) are set in the
 allowlist file, not in the environment.
 
+### Config repository
+
+Keep `doc-sync.yml` in a git repository of its own, holding that file and nothing else.
+Don't put it in a shared ops or scripts repository.
+
+The server finds the repository to commit in from the config path itself. It resolves
+`DOC_CACHE_MCP_CONFIG_PATH`, following symlinks, and runs `git rev-parse --show-toplevel`
+in the directory that contains the real file. `~/docs/doc-sync.yml` can stay a symlink,
+and wherever its target lives is where commits and pushes go. Moving the file to a new
+repository only means repointing the symlink, with no server change. Check where it
+resolves before you enable pushing:
+
+```bash
+git -C "$(dirname "$(readlink -f ~/docs/doc-sync.yml)")" rev-parse --show-toplevel
+```
+
+Why a dedicated repository:
+
+- **Credential scope.** A deploy key is granted per repository. If the file shares a
+  repository with code, the key that edits a URL list can also push to that code's `main`.
+- **Clean history.** Every add is a bot commit on `main`. In a shared repository those
+  commits mix into the history of everything else in it, and a deploy or review process
+  that checks the commit range in that history has to account for each one.
+
+`doc-sync.py` and the `doc-sync-daily` cron only read the file, through the same path, so
+they need no git access to the config repository.
+
 ### Pushing
 
 > **`DOC_CACHE_MCP_GIT_PUSH` is `false` by default. Turning it on gives this MCP
-> unattended write access to a shared repo's `main`.** Only enable it if you have read
-> the sequence below and provisioned a scoped deploy key.
+> unattended write access to the config repository's `main`.** Only enable it if you have
+> read the sequence below and provisioned a deploy key with write access to that one
+> repository (see [Config repository](#config-repository)).
 
 Without `GIT_PUSH` a commit stays on the local branch (`committed_local`). That is a
 problem when the caller is an agent with no git write access of its own: it can never
@@ -202,8 +230,7 @@ server, and every step is fail-closed — a check that cannot be *evaluated* is 
 5. **Push the SHA the guards inspected**, never the `HEAD` ref, using `DEPLOY_KEY_PATH`
    with `-F /dev/null`, `IdentitiesOnly=yes` and no ssh agent. `IdentitiesOnly` alone still
    offers `IdentityFile`s from `~/.ssh/config`; not reading the config at all is what makes
-   the deploy key the only identity, so the push URL must carry the user and port. Use a
-   key scoped to the single target repo.
+   the deploy key the only identity, so the push URL must carry the user and port.
 6. **If the push fails, roll back this call's commit** — a compare-and-swap of the branch
    from exactly this commit to exactly its parent, then a restore of the file if nobody
    edited it since. A concurrent commit makes the swap fail and nothing is reset: the
@@ -217,7 +244,11 @@ local branch without saying so in `outcome`. Git history, the audit trail and th
 agent-bus event make each change attributable and revertible after the fact; repoints and
 removals come only from the explicit tools, so they are intended.
 
-The deploy key should be mode `0600` and owned by the user the server runs as.
+**The deploy key must be write-scoped to the config repository and nothing else.** Add it
+as a deploy key with write access on that one repository only, never as a user or account
+key, and grant it nowhere else. The guards in step 4 limit what *this server* pushes. The
+key's scope limits what anyone holding the key file can push. The key should be mode
+`0600` and owned by the user the server runs as.
 
 ## Installation
 
@@ -227,7 +258,8 @@ Requirements:
 - A `doc-sync.py` that matches this release (failure state, `remove_topics`, provisional
   tier), with the generated `doc_cache_allowlist.py` next to it (see
   [Allowlist schema](#allowlist-schema-v2)).
-- `doc-sync.yml` inside a git checkout, if `GIT_COMMIT` is on (the default).
+- `doc-sync.yml` inside a git checkout, if `GIT_COMMIT` is on (the default). Use a
+  dedicated repository (see [Config repository](#config-repository)).
 - The allowlist file.
 
 doc-cache-mcp is not published to PyPI. The script below installs a release tag from a
