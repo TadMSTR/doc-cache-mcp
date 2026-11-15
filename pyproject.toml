@@ -51,8 +51,8 @@ dependencies = [
     # - opentelemetry-api: fastmcp parses every tool call's `_meta` trace context with it,
     #   whether or not a telemetry sink is configured. 1.45.2 fixes CVE-2026-126360 (floor
     #   raised 2026-11-15).
-    # - dnspython (2026-11-15): no request reaches it, but CVE-2026-128089 (fixed in 2.9.2)
-    #   turned up in the live venv, so it is floored rather than held by the lock alone.
+    # - dnspython (2026-11-15): no request reaches it; floored past CVE-2026-128089 (fixed
+    #   in 2.9.2) rather than held by the lock alone.
     # These ranges still admit an advisory but are held only by the lock, because no
     # request reaches the affected code: authlib, joserfc (fastmcp's auth providers; none is
     # configured), jaraco-context, protobuf and pyarrow (telemetry exporters),
