@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-15
+
+Dependency release. No application code changed.
+
+### Security
+
+- **dnspython 2.9.2** (CVE-2026-128089). The runtime dependencies now floor
+  `dnspython>=2.9.2` and `uv.lock` pins 2.9.2 (was 2.9.1). No request reaches dnspython;
+  the floor keeps a re-resolve from keeping the vulnerable release.
+- **opentelemetry-api floor raised to `>=1.45.2`** (CVE-2026-126360). The lock already
+  pinned 1.45.2; the floor now matches. Nothing else in the lock moved, so the `telemetry`
+  extra resolves exactly as before.
+
 ### Documentation
 
 - **README: new "Config repository" section.** Keep `doc-sync.yml` in a repository of its
