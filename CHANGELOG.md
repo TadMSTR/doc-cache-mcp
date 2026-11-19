@@ -17,8 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `sync_service` call, so the long-lived server does not carry it between tool calls.
 - The `fetch_classified` stubs in `test_indexfree_doc_sync.py` accept the new `label`
   keyword. No application code changed; `doc_cache_sync` keeps doc-sync's default retry
-  bounds. The added worst case is about 40 s per unreachable host in one call, and the 15 s
-  progress heartbeat keeps the call alive meanwhile.
+  bounds. Per unreachable host, a call can take up to about 40 s longer on the backoff path,
+  or about 90 s when the host answers 429/503 with a `Retry-After` (capped at 30 s per wait).
+  The breaker gives that host single attempts for the rest of the call. Across hosts, the
+  added time is capped by doc-sync's 300 s retry budget, which one in-flight retry can
+  overshoot by up to 45 s. The 15 s progress heartbeat keeps the call alive meanwhile.
 
 ## [0.4.1] — 2026-11-15
 
