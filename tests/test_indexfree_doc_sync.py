@@ -66,7 +66,9 @@ def ds(home, monkeypatch):
     """The fixture module as the server loads it, with the network stubbed out."""
     m = docsync.load_doc_sync()
     assert m.__file__ == str(home / "scripts" / "doc-sync.py")
-    monkeypatch.setattr(m, "fetch_classified", lambda url, max_redirects=5, label=None: (_MARKDOWN, "trusted"))
+    monkeypatch.setattr(
+        m, "fetch_classified", lambda url, max_redirects=5, label=None: (_MARKDOWN, "trusted")
+    )
     return m
 
 
