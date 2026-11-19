@@ -66,7 +66,9 @@ def ds(home, monkeypatch):
     """The fixture module as the server loads it, with the network stubbed out."""
     m = docsync.load_doc_sync()
     assert m.__file__ == str(home / "scripts" / "doc-sync.py")
-    monkeypatch.setattr(m, "fetch_classified", lambda url, max_redirects=5: (_MARKDOWN, "trusted"))
+    monkeypatch.setattr(
+        m, "fetch_classified", lambda url, max_redirects=5, label=None: (_MARKDOWN, "trusted")
+    )
     return m
 
 
@@ -99,7 +101,7 @@ async def test_clean_sync_is_ok(ds, home, metrics):
 
 
 async def test_fetch_failure_is_not_ok(ds, monkeypatch, metrics):
-    def boom(url, max_redirects=5):
+    def boom(url, max_redirects=5, label=None):
         raise OSError("unreachable")
 
     monkeypatch.setattr(ds, "fetch_classified", boom)
