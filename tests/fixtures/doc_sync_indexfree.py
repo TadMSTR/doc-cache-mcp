@@ -23,7 +23,9 @@ go to ~/.claude/docs-provisional/<service>/ instead. That directory is deliberat
 ~/.claude/memory: qmd's agent-memory collection and the memory pipeline walk that whole tree,
 so a directory there would be served, and promoted, as agent memory.
 
-Config: ~/docs/doc-sync.yml
+Config: ~/docs/doc-sync.yml, a symlink into the host-forge/doc-cache clone
+        (~/repos/gitea/host-forge-doc-cache/doc-sync.yml; it left this repo on 2026-11-11).
+        This script only reads it; doc-cache-mcp commits the changes to it.
 Cache:  ~/.claude/memory/docs/ (trusted), ~/.claude/docs-provisional/ (provisional)
 Log:    ~/docs/doc-sync.log
 
@@ -49,6 +51,7 @@ import sys
 import json
 import time
 import fcntl
+import random
 import hashlib
 import subprocess
 import yaml
@@ -56,9 +59,10 @@ import logging
 import requests
 import html2text
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 # The shared source-URL allowlist lives next to this script. When doc-sync.py is imported
 # by-path (e.g. by doc-cache-mcp) its own directory is not on sys.path — add it so the
@@ -213,7 +217,96 @@ def refuse_open_edit(url: str) -> None:
     _allow.refuse_open_edit(url, allowlist)
 
 
-def fetch_classified(url: str, max_redirects: int = 5) -> tuple[str, str]:
+# ── Transient-error retry (doc-sync-retry-2026-11, #1554 (id 1637)) ─────────────
+#
+# One reset or 504 used to fail the whole 03:00 run: 12 of 15 nights in November were red,
+# almost all on freedesktop.org / gnu.org / GitHub noise, and that hid two real breaks.
+#
+# The retry lives in fetch_classified's hop loop, NOT in a urllib3 Retry mounted on SESSION.
+# urllib3 would reconnect (fresh DNS lookup) after the allowlist check, with no re-check —
+# exactly the check-then-fetch gap fetch_classified exists to close (audit F-01) — and it
+# would not cover a read error midway through a streamed provisional body.
+#
+# Module constants so tests and doc-cache-mcp (interactive tool calls) can lower them.
+RETRY_ATTEMPTS  = 3          # 1 + 2 retries
+RETRY_BACKOFF_S = (2, 6)     # before retry 1 and retry 2
+RETRY_JITTER_S  = 1.0        # plus up to this much
+RETRY_TIMEOUT_S = 15         # request timeout on a retry; the first attempt keeps 30 s
+RETRY_AFTER_MAX = 30         # honour Retry-After only up to this; longer means don't retry
+RETRY_BUDGET_S  = 300        # total time per run spent on retries (backoff + retry attempts)
+RETRY_STATUSES  = frozenset({429, 500, 502, 503, 504})
+
+# Per RUN, never per process: doc-cache-mcp loads this file once into a long-lived daemon,
+# so module-global state would carry one tool call's tripped breaker or spent budget into
+# every later call. Reset by _reset_run_counters(), which main() and sync_service() call
+# under the state lock.
+_retry_spent = 0.0
+_retry_broken_hosts: set[str] = set()
+_retried_fetches = 0       # fetches (one per entry) that needed at least one retry
+
+
+def _requests_exc(name: str):
+    """A requests exception class by name, or None. The hermetic tests stub `requests`
+    out entirely when it is absent, and an `except` tuple must still build."""
+    for ns in (getattr(requests, "exceptions", None), requests):
+        cls = getattr(ns, name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            return cls
+    return None
+
+
+# SSLError and ProxyError subclass requests.ConnectionError. A failed TLS verification is the
+# provisional path's DNS-rebind guard (audit F-04): it must fail on the first attempt, so these
+# are caught and re-raised ahead of the retryable set. ReadTimeout and ChunkedEncodingError are
+# not ConnectionError subclasses, so they are listed explicitly.
+_NEVER_RETRY = tuple(c for c in map(_requests_exc, ("SSLError", "ProxyError")) if c)
+_RETRYABLE   = tuple(c for c in map(_requests_exc, (
+    "ConnectionError", "Timeout", "ChunkedEncodingError")) if c)
+
+_NO_HEADER = object()
+
+
+def _parse_retry_after(value: str) -> float | None:
+    """Seconds a ``Retry-After`` value asks for, or None if it is unparseable or over
+    RETRY_AFTER_MAX. Remote input: never sleep on an unbounded value."""
+    v = str(value).strip()
+    if len(v) > 64:
+        return None
+    if re.fullmatch(r"[0-9]{1,6}", v):
+        wait = float(int(v))
+    else:
+        try:
+            when = parsedate_to_datetime(v)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        wait = max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    return wait if wait <= RETRY_AFTER_MAX else None
+
+
+def _retry_wait(host: str, attempt: int, retry_after=_NO_HEADER) -> float | None:
+    """Seconds to wait before retrying ``attempt``, or None: don't retry, fail now."""
+    if attempt >= RETRY_ATTEMPTS:
+        if RETRY_ATTEMPTS > 1:
+            _retry_broken_hosts.add(host)  # used up its retries: single attempts from now on
+        return None
+    if host in _retry_broken_hosts or _retry_spent >= RETRY_BUDGET_S:
+        return None
+    if retry_after is not _NO_HEADER:
+        return _parse_retry_after(retry_after)
+    base = RETRY_BACKOFF_S[min(attempt - 1, len(RETRY_BACKOFF_S) - 1)]
+    return base + random.uniform(0, RETRY_JITTER_S)
+
+
+def _spend_retry(started: float) -> None:
+    global _retry_spent
+    _retry_spent += time.monotonic() - started
+
+
+def fetch_classified(url: str, max_redirects: int = 5, label: str | None = None) -> tuple[str, str]:
     """Fetch a URL with the docs-cache allowlist enforced AT FETCH TIME (SSRF / cache
     poisoning guard, F-01). Returns ``(text, trust)``.
 
@@ -236,42 +329,100 @@ def fetch_classified(url: str, max_redirects: int = 5) -> tuple[str, str]:
     need a valid certificate for the attacker's name), so a session with it disabled is
     refused for provisional fetches (audit F-04).
 
+    Transient failures — a connection error or timeout, a body read cut off midway, or a
+    429/5xx — are retried per hop (see RETRY_*). Each attempt re-runs the whole hop:
+    classify, the trusted-to-unvetted refusal and the library/TLS gates, then the request.
+    Everything else (AllowlistError, SSLError, ProxyError, other 4xx, the size cap,
+    TooManyRedirects) fails on the first attempt. ``label`` prefixes the retry WARNING.
+
     Raises ``doc_cache_allowlist.AllowlistError`` (refused), a requests error,
     ``requests.TooManyRedirects``, or ``ValueError`` (provisional body over the cap).
     """
-    allowlist = _get_allowlist()
+    global _retried_fetches
+    label = label or url
     current = url
     trust = _allow.TRUSTED
+    retried = False
     for _ in range(max_redirects + 1):
-        verdict = _allow.classify_url(current, allowlist)
-        if current != url and trust == _allow.TRUSTED and verdict.trust == _allow.PROVISIONAL:
-            raise _allow.AllowlistError(
-                f"a trusted source redirected to an unvetted host ({verdict.host!r}); "
-                "refused — register that URL itself if it should be cached"
+        hop_trust = trust  # the trust of everything before this hop
+        nxt = None
+        attempt = 0
+        wait = None
+        while nxt is None:
+            attempt += 1
+            started = None
+            if wait is not None:
+                started = time.monotonic()
+                time.sleep(wait)
+            host = urlsplit(current).hostname or current
+            r = None
+            try:
+                # Per attempt: a host taken off the allowlist during a backoff is refused
+                # on the retry (the snapshot is content-keyed, so this is a 1 KB read).
+                allowlist = _get_allowlist()
+                verdict = _allow.classify_url(current, allowlist)
+                host = verdict.host
+                if current != url and hop_trust == _allow.TRUSTED and verdict.trust == _allow.PROVISIONAL:
+                    raise _allow.AllowlistError(
+                        f"a trusted source redirected to an unvetted host ({verdict.host!r}); "
+                        "refused — register that URL itself if it should be cached"
+                    )
+                trust = _allow.lower_trust(hop_trust, verdict.trust)
+                old = _fetch_libs_too_old(MIN_FETCH_LIBS)
+                if old:
+                    raise RuntimeError(f"fetch refused: {old} (MIN_FETCH_LIBS)")
+                if trust == _allow.PROVISIONAL and getattr(SESSION, "verify", True) is False:
+                    raise _allow.AllowlistError(
+                        "TLS verification is disabled; provisional fetches rely on it (rebind guard)"
+                    )
+                if trust == _allow.PROVISIONAL:
+                    old = _fetch_libs_too_old(MIN_PROVISIONAL_LIBS)
+                    if old:
+                        raise _allow.AllowlistError(f"provisional fetch refused: {old} (MIN_PROVISIONAL_LIBS)")
+                timeout = 30 if attempt == 1 else RETRY_TIMEOUT_S
+                if trust == _allow.PROVISIONAL:
+                    r = SESSION.get(current, timeout=timeout, allow_redirects=False, stream=True)
+                else:
+                    r = SESSION.get(current, timeout=timeout, allow_redirects=False)
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("Location")
+                    if loc:
+                        _close(r)
+                        nxt = urljoin(current, loc)
+                        continue
+                if r.status_code in RETRY_STATUSES:
+                    ra = r.headers.get("Retry-After") if r.status_code in (429, 503) else None
+                    wait = _retry_wait(host, attempt, _NO_HEADER if ra is None else ra)
+                    if wait is not None:
+                        _close(r)
+                        cause = str(r.status_code)
+                    else:
+                        r.raise_for_status()
+                else:
+                    r.raise_for_status()
+                    if trust == _allow.PROVISIONAL:
+                        return _read_capped(r, allowlist["provisional"]["max_bytes"], current), trust
+                    return r.text, trust
+            except _NEVER_RETRY:
+                raise
+            except _RETRYABLE as e:
+                wait = _retry_wait(host, attempt)
+                if wait is None:
+                    raise
+                if r is not None:
+                    _close(r)
+                cause = type(e).__name__
+            finally:
+                if started is not None:
+                    _spend_retry(started)
+            if not retried:
+                retried = True
+                _retried_fetches += 1
+            log.warning(
+                f"{label} — retry {attempt}/{RETRY_ATTEMPTS - 1} after {cause} "
+                f"from {host} (wait {wait:.1f}s)"
             )
-        trust = _allow.lower_trust(trust, verdict.trust)
-        if trust == _allow.PROVISIONAL and getattr(SESSION, "verify", True) is False:
-            raise _allow.AllowlistError(
-                "TLS verification is disabled; provisional fetches rely on it (rebind guard)"
-            )
-        if trust == _allow.PROVISIONAL:
-            old = _urllib3_too_old()
-            if old:
-                raise _allow.AllowlistError(f"provisional fetch refused: {old} (audit F-01)")
-        if trust == _allow.PROVISIONAL:
-            r = SESSION.get(current, timeout=30, allow_redirects=False, stream=True)
-        else:
-            r = SESSION.get(current, timeout=30, allow_redirects=False)
-        if r.status_code in (301, 302, 303, 307, 308):
-            loc = r.headers.get("Location")
-            if loc:
-                _close(r)
-                current = urljoin(current, loc)
-                continue
-        r.raise_for_status()
-        if trust == _allow.PROVISIONAL:
-            return _read_capped(r, allowlist["provisional"]["max_bytes"], current), trust
-        return r.text, trust
+        current = nxt
     raise requests.TooManyRedirects(f"exceeded {max_redirects} redirects fetching {url}")
 
 
@@ -551,29 +702,49 @@ def load_config() -> dict:
 TRUSTED_EXPIRY_LIMIT = 5
 _trusted_expiries = 0
 
-#: The streaming read below is only safe on urllib3 >= 2.8.0 (GHSA-gh4c-6fx4-qh6g infinite
-#: loop, GHSA-vxq7-64xx-v4gw unbounded chunk-size line). A provisional host is anyone's
-#: server, so on an older urllib3 provisional fetches are refused rather than trusted to a
-#: deploy step (audit F-01 / R2-02).
-MIN_URLLIB3 = (2, 8, 0)
+#: Every fetch, trusted or provisional, is refused before any request unless the libraries
+#: that carry it are at their floors: certifi 2026.10.18 drops the emSign roots whose
+#: intermediate keys were compromised (that impersonates any host, trusted ones included);
+#: requests 2.33.0 and idna 3.15 are the floors doc-cache-mcp declares for this path. This
+#: script's own venv has no requirements file (venv-advisories-2026-10 p5 audit F-02, R2-03).
+MIN_FETCH_LIBS = {
+    "certifi": (2026, 10, 18),
+    "requests": (2, 33, 0),
+    "idna": (3, 15),
+}
+#: Provisional fetches also need urllib3 2.8.0: the streaming read below (GHSA-gh4c-6fx4-qh6g
+#: infinite loop, GHSA-vxq7-64xx-v4gw unbounded chunk-size line) is only used for them, and a
+#: provisional host is anyone's server (doc-cache-friction audit F-01 / R2-02).
+MIN_PROVISIONAL_LIBS = {
+    "urllib3": (2, 8, 0),
+}
 
 
 def _reset_run_counters() -> None:
-    global _trusted_expiries
+    global _trusted_expiries, _retry_spent, _retried_fetches
     _trusted_expiries = 0
+    _retry_spent = 0.0
+    _retried_fetches = 0
+    _retry_broken_hosts.clear()
 
 
-def _urllib3_too_old() -> str | None:
-    try:
-        import urllib3
-    except ImportError:  # only in hermetic tests that stub requests out entirely
-        return None
-    try:
-        have = tuple(int(x) for x in urllib3.__version__.split(".")[:3])
-    except ValueError:
-        return f"unparseable urllib3 version {urllib3.__version__!r}"
-    if have < MIN_URLLIB3:
-        return f"urllib3 {urllib3.__version__} < {'.'.join(map(str, MIN_URLLIB3))}"
+def _fetch_libs_too_old(floors: dict) -> str | None:
+    """Name the first library in `floors` below its floor, or None. Fails closed: a version
+    it cannot read is reported, not passed."""
+    import importlib
+
+    for name, floor in floors.items():
+        try:
+            mod = importlib.import_module(name)
+        except ImportError:  # only in hermetic tests that stub requests out entirely
+            continue
+        version = getattr(mod, "__version__", None)
+        try:
+            have = tuple(int(x) for x in str(version).split(".")[: len(floor)])
+        except ValueError:
+            return f"unparseable {name} version {version!r}"
+        if have < floor:
+            return f"{name} {version} < {'.'.join(map(str, floor))}"
     return None
 
 
@@ -627,7 +798,7 @@ def sync_entry_detail(service: str, entry: dict) -> dict:
                 f"skipped, {len(gone)} chunk(s) removed"
             )
             return {"status": "expired_provisional", "chunks": 0, "trust": tier, "error": None}
-        raw, trust = fetch_classified(url)
+        raw, trust = fetch_classified(url, label=f"[{service}] {topic}")
         md       = to_markdown(raw, url)
         chunks   = chunk_by_headings(md)
         if not chunks:
@@ -852,7 +1023,7 @@ def main():
 
     log.info(
         f"Sync complete. {total_synced} entries synced, {total_errors} errors, "
-        f"{total_expired} expired provisional skipped."
+        f"{_retried_fetches} retried, {total_expired} expired provisional skipped."
     )
 
     # A failed prune fails the run, unlike memory-expire's warning: a stale row

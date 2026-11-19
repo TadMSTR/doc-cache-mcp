@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Tests
+
+- **Re-synced `tests/fixtures/doc_sync_indexfree.py` with doc-sync.py.** The fixture still
+  had the old `MIN_URLLIB3` / `_urllib3_too_old` fetch floors, so the forge-local drift guard
+  `test_fixture_matches_live_less_the_index_step` failed (vikunja#1524). It now carries the
+  current script, including its new transient-error retry in `fetch_classified` (vikunja#1554):
+  connection errors, timeouts, cut-off bodies and 429/5xx are retried per redirect hop, with
+  the allowlist re-checked before every attempt. Breaker and budget state resets on every
+  `sync_service` call, so the long-lived server does not carry it between tool calls.
+- The `fetch_classified` stubs in `test_indexfree_doc_sync.py` accept the new `label`
+  keyword. No application code changed; `doc_cache_sync` keeps doc-sync's default retry
+  bounds. The added worst case is about 40 s per unreachable host in one call, and the 15 s
+  progress heartbeat keeps the call alive meanwhile.
+
 ## [0.4.1] — 2026-11-15
 
 Dependency release. No application code changed.
