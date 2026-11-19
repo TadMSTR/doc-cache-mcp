@@ -21,7 +21,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   or about 90 s when the host answers 429/503 with a `Retry-After` (capped at 30 s per wait).
   The breaker gives that host single attempts for the rest of the call. Across hosts, the
   added time is capped by doc-sync's 300 s retry budget, which one in-flight retry can
-  overshoot by up to 45 s. The 15 s progress heartbeat keeps the call alive meanwhile.
+  overshoot by up to 45 s with a responsive server (the request timeout is per read, not a
+  total deadline, so a server that trickles bytes can stretch an attempt further). The 15 s
+  progress heartbeat keeps the call alive meanwhile.
+- The nightly doc-sync run holds the doc-sync state lock for its whole run, and its retries
+  can now keep it for several minutes longer during a multi-host outage. A `doc_cache_sync`
+  call in that window waits up to 120 s for the lock and then fails with `TimeoutError`. The
+  reverse also holds: an interactive sync of a service on a dead host holds the lock while it
+  retries.
 
 ## [0.4.1] — 2026-11-15
 
